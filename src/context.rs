@@ -1,11 +1,20 @@
 //! `WorkflowCtx`: the sole capability a workflow receives. Every effect a
 //! workflow requests goes through here, so replay can intercept it.
+//!
+//! `ReplayCursor` and `EngineError` live here rather than in `engine.rs`:
+//! `WorkflowCtx::step` is their primary consumer, and `Engine` (in
+//! `engine.rs`) depends on `WorkflowCtx` to drive a workflow, so putting
+//! them in `engine.rs` instead would make the two modules depend on each
+//! other.
+
+use thiserror::Error;
 
 use crate::command::CommandKind;
-use crate::engine::EngineError;
-use crate::engine::ReplayCursor;
 use crate::execution::ExecutionId;
+use crate::execution::WorkflowVersion;
 use crate::journal::EventPayload;
+use crate::journal::Journal;
+use crate::journal::JournalError;
 use crate::journal::JournalEvent;
 use crate::journal::JournalStore;
 use crate::journal::Seq;
@@ -14,6 +23,59 @@ use crate::step::IdempotencyKey;
 use crate::step::StepError;
 use crate::step::StepErrorRecord;
 use crate::step::StepName;
+
+/// Walks a loaded `Journal` command by command during replay.
+#[derive(Debug, Clone)]
+pub struct ReplayCursor {
+    events: Vec<JournalEvent>,
+    position: usize,
+}
+
+impl ReplayCursor {
+    pub fn new(journal: Journal) -> Self {
+        Self {
+            events: journal.events().to_vec(),
+            position: 0,
+        }
+    }
+
+    /// True once every journaled event has been consumed.
+    pub fn is_exhausted(&self) -> bool {
+        self.position >= self.events.len()
+    }
+
+    /// The next unconsumed event, without advancing.
+    pub fn peek(&self) -> Option<&JournalEvent> {
+        self.events.get(self.position)
+    }
+
+    /// Consumes the event returned by the last `peek`.
+    pub fn advance(&mut self) {
+        self.position += 1;
+    }
+}
+
+/// Errors from running or recovering an execution.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum EngineError {
+    #[error(
+        "nondeterministic workflow at seq {seq:?}: journal has {expected:?}, code produced {got:?}"
+    )]
+    Nondeterminism {
+        seq: Seq,
+        expected: CommandKind,
+        got: CommandKind,
+    },
+
+    #[error("workflow version mismatch: journal {recorded:?}, code {current:?}")]
+    VersionMismatch {
+        recorded: WorkflowVersion,
+        current: WorkflowVersion,
+    },
+
+    #[error("journal error: {0}")]
+    Journal(#[from] JournalError),
+}
 
 /// Replay-vs-live execution mode. Not a typestate: the transition happens
 /// mid-run at journal exhaustion, inside one `&mut` borrow of `WorkflowCtx`,
@@ -182,8 +244,6 @@ impl<'a, S: JournalStore> WorkflowCtx<'a, S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::journal::Journal;
-    use crate::journal::JournalError;
     use crate::random::RandomBytes;
     use crate::random::RngSource;
     use crate::stores::memory::MemoryJournal;
@@ -531,5 +591,67 @@ mod tests {
         let key = observed_key.unwrap();
         assert_eq!(key.execution(), execution);
         assert_eq!(key.seq(), Seq::zero());
+    }
+
+    #[test]
+    fn new_cursor_over_empty_journal_is_exhausted() {
+        let cursor = ReplayCursor::new(Journal::empty());
+
+        assert!(cursor.is_exhausted());
+        assert_eq!(cursor.peek(), None);
+    }
+
+    #[test]
+    fn new_cursor_over_nonempty_journal_is_not_exhausted() {
+        let journal = Journal::new(vec![JournalEvent::StepScheduled {
+            seq: Seq::zero(),
+            name: charge_card(),
+        }]);
+
+        let cursor = ReplayCursor::new(journal);
+
+        assert!(!cursor.is_exhausted());
+    }
+
+    #[test]
+    fn peek_returns_the_event_at_the_current_position() {
+        let scheduled = JournalEvent::StepScheduled {
+            seq: Seq::zero(),
+            name: charge_card(),
+        };
+        let cursor = ReplayCursor::new(Journal::new(vec![scheduled.clone()]));
+
+        assert_eq!(cursor.peek(), Some(&scheduled));
+    }
+
+    #[test]
+    fn advance_moves_to_the_next_event() {
+        let scheduled = JournalEvent::StepScheduled {
+            seq: Seq::zero(),
+            name: charge_card(),
+        };
+        let started = JournalEvent::StepStarted {
+            seq: Seq::zero(),
+            attempt: Attempt::first(),
+        };
+        let mut cursor = ReplayCursor::new(Journal::new(vec![scheduled, started.clone()]));
+
+        cursor.advance();
+
+        assert_eq!(cursor.peek(), Some(&started));
+    }
+
+    #[test]
+    fn advance_past_the_last_event_exhausts_the_cursor() {
+        let scheduled = JournalEvent::StepScheduled {
+            seq: Seq::zero(),
+            name: charge_card(),
+        };
+        let mut cursor = ReplayCursor::new(Journal::new(vec![scheduled]));
+
+        cursor.advance();
+
+        assert!(cursor.is_exhausted());
+        assert_eq!(cursor.peek(), None);
     }
 }

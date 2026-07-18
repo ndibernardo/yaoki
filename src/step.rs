@@ -120,7 +120,7 @@ pub enum StepError {
     #[error("step failed: {0:?}")]
     Failed(StepErrorRecord),
     #[error("engine error: {0}")]
-    Engine(#[from] crate::engine::EngineError),
+    Engine(#[from] crate::context::EngineError),
 }
 
 #[cfg(test)]
