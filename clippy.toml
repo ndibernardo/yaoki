@@ -1,0 +1,11 @@
+allow-panic-in-tests = true
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-dbg-in-tests = true
+
+disallowed-methods = [
+    { path = "std::time::SystemTime::now", reason = "ambient time, go through the Clock trait so ctx.now() can journal it" },
+    { path = "std::time::Instant::now", reason = "ambient time, go through the Clock trait so ctx.now() can journal it" },
+    { path = "rand::random", reason = "ambient randomness, go through the RngSource trait so ctx.random() can journal it" },
+    { path = "uuid::Uuid::new_v4", reason = "ambient randomness, construct ExecutionId via RngSource instead" },
+]
