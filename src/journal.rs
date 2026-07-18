@@ -1,7 +1,9 @@
 //! The journal: source of truth for an execution. Append-only, never
-//! rewritten. `JournalStore` and `MemoryJournal` land next.
+//! rewritten.
 
-use crate::execution::{WorkflowErrorRecord, WorkflowName, WorkflowVersion};
+use thiserror::Error;
+
+use crate::execution::{ExecutionId, WorkflowErrorRecord, WorkflowName, WorkflowVersion};
 use crate::random::RandomBytes;
 use crate::step::{Attempt, StepErrorRecord, StepName};
 use crate::time::{Deadline, Timestamp};
@@ -23,6 +25,12 @@ impl Seq {
 
     pub fn get(self) -> u64 {
         self.0
+    }
+
+    /// Builds a `Seq` from a store's raw append position. Store-internal:
+    /// callers outside this crate never construct a `Seq` out of thin air.
+    pub(crate) fn from_index(index: u64) -> Self {
+        Self(index)
     }
 }
 
@@ -46,7 +54,7 @@ impl EventPayload {
 }
 
 /// One durable fact about an execution. Append-only, never rewritten.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JournalEvent {
     ExecutionStarted {
         workflow: WorkflowName,
@@ -91,6 +99,50 @@ pub enum JournalEvent {
     ExecutionFailed {
         error: WorkflowErrorRecord,
     },
+}
+
+/// One execution's full event history, in append order.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Journal(Vec<JournalEvent>);
+
+impl Journal {
+    pub fn new(events: Vec<JournalEvent>) -> Self {
+        Self(events)
+    }
+
+    pub fn empty() -> Self {
+        Self(Vec::new())
+    }
+
+    pub fn events(&self) -> &[JournalEvent] {
+        &self.0
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// Failures a `JournalStore` can report.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum JournalError {
+    #[error("journal store lock poisoned")]
+    Poisoned,
+}
+
+/// Append-only event log, one logical stream per execution.
+pub trait JournalStore {
+    /// Appends `event` to the execution's log. Returns the 0-based position
+    /// the event was appended at.
+    fn append(&self, id: &ExecutionId, event: JournalEvent) -> Result<Seq, JournalError>;
+
+    /// Loads the full event history for `id`. An execution with no events
+    /// yet (never started) loads as an empty `Journal`, not an error.
+    fn load(&self, id: &ExecutionId) -> Result<Journal, JournalError>;
 }
 
 #[cfg(test)]
@@ -141,5 +193,32 @@ mod tests {
             }
             other => panic!("expected StepCompleted, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn journal_empty_has_no_events() {
+        let journal = Journal::empty();
+
+        assert!(journal.is_empty());
+        assert_eq!(journal.len(), 0);
+        assert_eq!(journal.events(), &[]);
+    }
+
+    #[test]
+    fn journal_new_preserves_append_order() {
+        let scheduled = JournalEvent::StepScheduled {
+            seq: Seq::zero(),
+            name: StepName::new("charge-card").unwrap(),
+        };
+        let started = JournalEvent::StepStarted {
+            seq: Seq::zero(),
+            attempt: Attempt::first(),
+        };
+
+        let journal = Journal::new(vec![scheduled.clone(), started.clone()]);
+
+        assert!(!journal.is_empty());
+        assert_eq!(journal.len(), 2);
+        assert_eq!(journal.events(), &[scheduled, started]);
     }
 }
