@@ -3,10 +3,17 @@
 
 use thiserror::Error;
 
-use crate::execution::{ExecutionId, WorkflowErrorRecord, WorkflowName, WorkflowVersion};
+use crate::command::CommandKind;
+use crate::execution::ExecutionId;
+use crate::execution::WorkflowErrorRecord;
+use crate::execution::WorkflowName;
+use crate::execution::WorkflowVersion;
 use crate::random::RandomBytes;
-use crate::step::{Attempt, StepErrorRecord, StepName};
-use crate::time::{Deadline, Timestamp};
+use crate::step::Attempt;
+use crate::step::StepErrorRecord;
+use crate::step::StepName;
+use crate::time::Deadline;
+use crate::time::Timestamp;
 
 /// 0-based position of a command in an execution's command sequence.
 /// `Seq` increments per command (step, now, random, timer), giving replay a
@@ -101,6 +108,28 @@ pub enum JournalEvent {
     },
 }
 
+impl JournalEvent {
+    /// The `CommandKind` this event represents having been commanded, if
+    /// any. `None` for events that only ever follow a scheduling event
+    /// (`StepStarted`, `StepCompleted`, `StepFailed`, `TimerFired`) or that
+    /// bookend the whole execution rather than a single command.
+    pub fn command_kind(&self) -> Option<CommandKind> {
+        match self {
+            JournalEvent::StepScheduled { .. } => Some(CommandKind::RunStep),
+            JournalEvent::NowRecorded { .. } => Some(CommandKind::ReadNow),
+            JournalEvent::RandomRecorded { .. } => Some(CommandKind::DrawRandom),
+            JournalEvent::TimerScheduled { .. } => Some(CommandKind::Sleep),
+            JournalEvent::ExecutionStarted { .. }
+            | JournalEvent::StepStarted { .. }
+            | JournalEvent::StepCompleted { .. }
+            | JournalEvent::StepFailed { .. }
+            | JournalEvent::TimerFired { .. }
+            | JournalEvent::ExecutionCompleted { .. }
+            | JournalEvent::ExecutionFailed { .. } => None,
+        }
+    }
+}
+
 /// One execution's full event history, in append order.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Journal(Vec<JournalEvent>);
@@ -192,6 +221,81 @@ mod tests {
                 assert_eq!(got_result, result);
             }
             other => panic!("expected StepCompleted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn command_kind_maps_step_scheduled_to_run_step() {
+        let event = JournalEvent::StepScheduled {
+            seq: Seq::zero(),
+            name: StepName::new("charge-card").unwrap(),
+        };
+
+        assert_eq!(event.command_kind(), Some(CommandKind::RunStep));
+    }
+
+    #[test]
+    fn command_kind_maps_now_recorded_to_read_now() {
+        let event = JournalEvent::NowRecorded {
+            seq: Seq::zero(),
+            value: Timestamp::from_millis_since_epoch(1_753_401_600_000),
+        };
+
+        assert_eq!(event.command_kind(), Some(CommandKind::ReadNow));
+    }
+
+    #[test]
+    fn command_kind_maps_random_recorded_to_draw_random() {
+        let event = JournalEvent::RandomRecorded {
+            seq: Seq::zero(),
+            value: RandomBytes::new([0u8; 32]),
+        };
+
+        assert_eq!(event.command_kind(), Some(CommandKind::DrawRandom));
+    }
+
+    #[test]
+    fn command_kind_maps_timer_scheduled_to_sleep() {
+        let event = JournalEvent::TimerScheduled {
+            seq: Seq::zero(),
+            deadline: Deadline::at(Timestamp::from_millis_since_epoch(1_753_401_600_000)),
+        };
+
+        assert_eq!(event.command_kind(), Some(CommandKind::Sleep));
+    }
+
+    #[test]
+    fn command_kind_is_none_for_non_scheduling_events() {
+        let events = [
+            JournalEvent::ExecutionStarted {
+                workflow: WorkflowName::new("signup").unwrap(),
+                version: WorkflowVersion::new("2026.07.18").unwrap(),
+                input: EventPayload::new(b"{}".to_vec()),
+            },
+            JournalEvent::StepStarted {
+                seq: Seq::zero(),
+                attempt: Attempt::first(),
+            },
+            JournalEvent::StepCompleted {
+                seq: Seq::zero(),
+                result: EventPayload::new(b"charged".to_vec()),
+            },
+            JournalEvent::StepFailed {
+                seq: Seq::zero(),
+                attempt: Attempt::first(),
+                error: StepErrorRecord::new("payment gateway timed out"),
+            },
+            JournalEvent::TimerFired { seq: Seq::zero() },
+            JournalEvent::ExecutionCompleted {
+                output: EventPayload::new(b"done".to_vec()),
+            },
+            JournalEvent::ExecutionFailed {
+                error: WorkflowErrorRecord::new("account creation rolled back"),
+            },
+        ];
+
+        for event in events {
+            assert_eq!(event.command_kind(), None, "unexpected kind for {event:?}");
         }
     }
 

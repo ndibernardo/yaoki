@@ -3,7 +3,7 @@
 use thiserror::Error;
 
 use crate::execution::ExecutionId;
-use crate::journal::{EventPayload, Seq};
+use crate::journal::Seq;
 
 /// Non-empty, trimmed, `[a-z0-9-]` step name. Position-stable across replays.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -92,13 +92,6 @@ impl StepErrorRecord {
     }
 }
 
-/// Outcome of running a step's closure once, before it is journaled.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StepOutcome {
-    Completed(EventPayload),
-    Failed(StepErrorRecord),
-}
-
 /// `(ExecutionId, Seq)`, handed to every step closure so external calls can
 /// deduplicate. The honest answer to non-atomic journal+effect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -121,10 +114,20 @@ impl IdempotencyKey {
     }
 }
 
+/// Failures from `WorkflowCtx::step`.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum StepError {
+    #[error("step failed: {0:?}")]
+    Failed(StepErrorRecord),
+    #[error("engine error: {0}")]
+    Engine(#[from] crate::engine::EngineError),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::random::{RandomBytes, RngSource};
+    use crate::random::RandomBytes;
+    use crate::random::RngSource;
 
     fn charge_card_bytes() -> [u8; 32] {
         let mut bytes = [0u8; 32];

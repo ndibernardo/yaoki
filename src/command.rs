@@ -14,6 +14,27 @@ pub enum Command {
     Sleep { deadline: Deadline },
 }
 
+/// A `Command`'s variant, stripped of arguments. Reported by
+/// `EngineError::Nondeterminism` when replay diverges from the journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandKind {
+    RunStep,
+    ReadNow,
+    DrawRandom,
+    Sleep,
+}
+
+impl Command {
+    pub fn kind(&self) -> CommandKind {
+        match self {
+            Command::RunStep { .. } => CommandKind::RunStep,
+            Command::ReadNow => CommandKind::ReadNow,
+            Command::DrawRandom => CommandKind::DrawRandom,
+            Command::Sleep { .. } => CommandKind::Sleep,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -40,5 +61,29 @@ mod tests {
         let command = Command::Sleep { deadline };
 
         assert_eq!(command, Command::Sleep { deadline });
+    }
+
+    #[test]
+    fn kind_maps_run_step_to_run_step_kind() {
+        let name = StepName::new("charge-card").unwrap();
+
+        assert_eq!(Command::RunStep { name }.kind(), CommandKind::RunStep);
+    }
+
+    #[test]
+    fn kind_maps_read_now_to_read_now_kind() {
+        assert_eq!(Command::ReadNow.kind(), CommandKind::ReadNow);
+    }
+
+    #[test]
+    fn kind_maps_draw_random_to_draw_random_kind() {
+        assert_eq!(Command::DrawRandom.kind(), CommandKind::DrawRandom);
+    }
+
+    #[test]
+    fn kind_maps_sleep_to_sleep_kind() {
+        let deadline = Deadline::at(Timestamp::from_millis_since_epoch(1_753_401_600_000));
+
+        assert_eq!(Command::Sleep { deadline }.kind(), CommandKind::Sleep);
     }
 }

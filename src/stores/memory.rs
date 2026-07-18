@@ -7,7 +7,11 @@ use std::sync::Mutex;
 
 use crate::equivalence::TransactionalBoundary;
 use crate::execution::ExecutionId;
-use crate::journal::{Journal, JournalError, JournalEvent, JournalStore, Seq};
+use crate::journal::Journal;
+use crate::journal::JournalError;
+use crate::journal::JournalEvent;
+use crate::journal::JournalStore;
+use crate::journal::Seq;
 
 /// `Mutex<HashMap<ExecutionId, Vec<JournalEvent>>>`. Mutex is justified:
 /// genuinely shared mutable state across engine tasks.
@@ -43,9 +47,11 @@ impl TransactionalBoundary for MemoryJournal {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution::{WorkflowName, WorkflowVersion};
+    use crate::execution::WorkflowName;
+    use crate::execution::WorkflowVersion;
     use crate::journal::EventPayload;
-    use crate::random::{RandomBytes, RngSource};
+    use crate::random::RandomBytes;
+    use crate::random::RngSource;
     use crate::step::StepName;
 
     /// Test double returning the same bytes every draw.
