@@ -1,0 +1,17 @@
+[package]
+name = "yaoki"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+
+[dependencies]
+thiserror = "2.0.18"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+
+[dev-dependencies]
+proptest = "1.11.0"
+trybuild = "1.0.118"
+
+[workspace]
+resolver = "3"
