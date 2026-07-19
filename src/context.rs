@@ -93,6 +93,18 @@ enum StepDecision {
     RunLive,
 }
 
+/// What replay found after matching a journaled `StepScheduled`.
+enum ReplayedStep {
+    /// A terminal outcome (`StepCompleted`/`StepFailed`, or a divergence).
+    /// Answer from the journal, do not run the closure.
+    Recorded(Result<EventPayload, StepError>),
+    /// `StepStarted` was journaled but nothing followed: the process died
+    /// mid-step, either before or after the side effect landed. The engine
+    /// cannot tell which, so it reruns; `DuplicateLast`/idempotency keys
+    /// absorb a duplicate effect.
+    Rerun,
+}
+
 /// The only capability a workflow receives. Every effect goes through here
 /// so replay can intercept it.
 pub struct WorkflowCtx<'a, S: JournalStore> {
@@ -135,7 +147,10 @@ impl<'a, S: JournalStore> WorkflowCtx<'a, S> {
                     name: journaled, ..
                 }) if journaled == name => {
                     cursor.advance();
-                    StepDecision::UseRecorded(Self::replay_step_outcome(cursor, seq))
+                    match Self::replay_step_outcome(cursor, seq) {
+                        ReplayedStep::Recorded(result) => StepDecision::UseRecorded(result),
+                        ReplayedStep::Rerun => StepDecision::RunLive,
+                    }
                 }
                 Some(event) => {
                     let expected = event.command_kind().unwrap_or(CommandKind::RunStep);
@@ -161,33 +176,39 @@ impl<'a, S: JournalStore> WorkflowCtx<'a, S> {
 
     /// Resolves a step already matched against a journaled `StepScheduled`:
     /// consumes the following `StepStarted` (if present) and returns the
-    /// recorded `StepCompleted`/`StepFailed` outcome without running `f`.
-    fn replay_step_outcome(cursor: &mut ReplayCursor, seq: Seq) -> Result<EventPayload, StepError> {
-        if let Some(JournalEvent::StepStarted { .. }) = cursor.peek() {
+    /// recorded `StepCompleted`/`StepFailed` outcome, or signals a rerun.
+    fn replay_step_outcome(cursor: &mut ReplayCursor, seq: Seq) -> ReplayedStep {
+        let started = matches!(cursor.peek(), Some(JournalEvent::StepStarted { .. }));
+        if started {
             cursor.advance();
         }
         match cursor.peek().cloned() {
             Some(JournalEvent::StepCompleted { result, .. }) => {
                 cursor.advance();
-                Ok(result)
+                ReplayedStep::Recorded(Ok(result))
             }
             Some(JournalEvent::StepFailed { error, .. }) => {
                 cursor.advance();
-                Err(StepError::Failed(error))
+                ReplayedStep::Recorded(Err(StepError::Failed(error)))
             }
             Some(event) => {
                 let expected = event.command_kind().unwrap_or(CommandKind::RunStep);
-                Err(StepError::Engine(EngineError::Nondeterminism {
+                ReplayedStep::Recorded(Err(StepError::Engine(EngineError::Nondeterminism {
                     seq,
                     expected,
                     got: CommandKind::RunStep,
-                }))
+                })))
             }
-            None => Err(StepError::Engine(EngineError::Nondeterminism {
+            // `StepScheduled` alone, with no `StepStarted`, is not a
+            // documented crash window (`run_live` always appends both in
+            // the same call). Treat it as a divergence rather than a
+            // rerun.
+            None if started => ReplayedStep::Rerun,
+            None => ReplayedStep::Recorded(Err(StepError::Engine(EngineError::Nondeterminism {
                 seq,
                 expected: CommandKind::RunStep,
                 got: CommandKind::RunStep,
-            })),
+            }))),
         }
     }
 
@@ -519,6 +540,51 @@ mod tests {
                 JournalEvent::StepCompleted {
                     seq: Seq::zero().next(),
                     result: account_created,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn replaying_step_started_with_no_further_events_reruns_the_step_live() {
+        // Crash between StepStarted and StepCompleted: the journal
+        // ends right after StepStarted. The step must rerun live, not error.
+        let store = MemoryJournal::new();
+        let execution = signup_execution();
+        let journal = Journal::new(vec![
+            JournalEvent::StepScheduled {
+                seq: Seq::zero(),
+                name: charge_card(),
+            },
+            JournalEvent::StepStarted {
+                seq: Seq::zero(),
+                attempt: Attempt::first(),
+            },
+        ]);
+        let mut ctx = WorkflowCtx::new(&store, execution, ReplayCursor::new(journal));
+
+        let result = ctx.step(charge_card(), |_key| Ok(charge_confirmation()));
+
+        // Closure ran live and its outcome was freshly journaled to
+        // the store (the pre-existing StepScheduled/StepStarted pair above
+        // only seeds the replay cursor, mirroring the other tests in this
+        // module, and was never written to `store` itself).
+        assert_eq!(result, Ok(charge_confirmation()));
+        let journal = store.load(&execution).unwrap();
+        assert_eq!(
+            journal.events(),
+            &[
+                JournalEvent::StepScheduled {
+                    seq: Seq::zero(),
+                    name: charge_card(),
+                },
+                JournalEvent::StepStarted {
+                    seq: Seq::zero(),
+                    attempt: Attempt::first(),
+                },
+                JournalEvent::StepCompleted {
+                    seq: Seq::zero(),
+                    result: charge_confirmation(),
                 },
             ]
         );
