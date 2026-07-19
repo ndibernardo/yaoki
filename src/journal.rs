@@ -161,6 +161,19 @@ impl Journal {
 pub enum JournalError {
     #[error("journal store lock poisoned")]
     Poisoned,
+
+    /// Environmental I/O failure (open, read, write, fsync). Captured as a
+    /// message, not `#[from] std::io::Error`: `io::Error` has no `PartialEq`,
+    /// and this crate's own error types are compared with `assert_eq!`
+    /// throughout.
+    #[error("journal I/O error: {message}")]
+    Io { message: String },
+
+    /// A frame passed its CRC/length check but decoded into a domain value
+    /// a validated constructor rejects (e.g. an empty `StepName`). Distinct
+    /// from a torn write: those are truncated silently, never surfaced here.
+    #[error("journal record is malformed: {message}")]
+    Codec { message: String },
 }
 
 /// Append-only event log, one logical stream per execution.
