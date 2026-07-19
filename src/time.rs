@@ -3,6 +3,8 @@
 
 use std::sync::Mutex;
 use std::sync::PoisonError;
+use std::thread;
+use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
@@ -41,6 +43,11 @@ impl Deadline {
 /// sanctioned caller.
 pub trait Clock {
     fn now(&self) -> Timestamp;
+
+    /// Blocks until `deadline`. A deadline already in the past returns
+    /// immediately. Recovery re-arming an already-expired timer must fire
+    /// it, not wait again. `TestClock` never blocks at all.
+    fn sleep_until(&self, deadline: Timestamp);
 }
 
 /// Real wall clock.
@@ -61,6 +68,14 @@ impl Clock for SystemClock {
             .unwrap_or_default()
             .as_millis();
         Timestamp::from_millis_since_epoch(millis as u64)
+    }
+
+    fn sleep_until(&self, deadline: Timestamp) {
+        let now = self.now();
+        if deadline > now {
+            let remaining = deadline.as_millis_since_epoch() - now.as_millis_since_epoch();
+            thread::sleep(Duration::from_millis(remaining));
+        }
     }
 }
 
@@ -89,6 +104,10 @@ impl Clock for TestClock {
     fn now(&self) -> Timestamp {
         *self.now.lock().unwrap_or_else(PoisonError::into_inner)
     }
+
+    /// Never blocks. Advance the clock explicitly with `advance_millis`
+    /// instead of waiting on wall time.
+    fn sleep_until(&self, _deadline: Timestamp) {}
 }
 
 #[cfg(test)]
@@ -140,5 +159,29 @@ mod tests {
             clock.now(),
             Timestamp::from_millis_since_epoch(1_753_401_600_050)
         );
+    }
+
+    #[test]
+    fn system_clock_sleep_until_returns_immediately_when_the_deadline_has_passed() {
+        let clock = SystemClock;
+        let already_past = Timestamp::from_millis_since_epoch(1);
+
+        let before = clock.now();
+        clock.sleep_until(already_past);
+        let after = clock.now();
+
+        // No observable wait: allow generous scheduling slack rather than
+        // asserting an exact zero-duration bound.
+        assert!(after.as_millis_since_epoch() - before.as_millis_since_epoch() < 1000);
+    }
+
+    #[test]
+    fn test_clock_sleep_until_never_blocks() {
+        let clock = TestClock::at(Timestamp::from_millis_since_epoch(0));
+        let one_week_away = Timestamp::from_millis_since_epoch(604_800_000);
+
+        clock.sleep_until(one_week_away);
+
+        assert_eq!(clock.now(), Timestamp::from_millis_since_epoch(0));
     }
 }

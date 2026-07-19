@@ -26,6 +26,7 @@ use crate::step::StepError;
 use crate::step::StepErrorRecord;
 use crate::step::StepName;
 use crate::time::Clock;
+use crate::time::Deadline;
 use crate::time::Timestamp;
 
 /// Walks a loaded `Journal` command by command during replay.
@@ -115,6 +116,19 @@ enum ReplayedStep {
 enum ReplayedEffect<T> {
     Recorded(Result<T, EngineError>),
     Live,
+}
+
+/// A decision made while resolving one `sleep_until()` call.
+enum SleepDecision {
+    /// `TimerScheduled` + `TimerFired` both journaled, or a divergence.
+    UseRecorded(Result<(), EngineError>),
+    /// `TimerScheduled` journaled, `TimerFired` missing: the process died
+    /// mid-wait. Re-arm toward the already-journaled deadline without
+    /// re-appending `TimerScheduled`, and journal `TimerFired` once the wait
+    /// (a no-op if the deadline already passed) returns.
+    Rearm,
+    /// Nothing journaled at this position: a brand-new timer.
+    RunLive,
 }
 
 /// The only capability a workflow receives. Every effect goes through here
@@ -232,6 +246,79 @@ impl<'a, S: JournalStore> WorkflowCtx<'a, S> {
                     .append(&self.execution, JournalEvent::RandomRecorded { seq, value })
                     .map_err(EngineError::from)?;
                 Ok(value)
+            }
+        }
+    }
+
+    /// Durable timer. Journals the wall-clock `deadline`; survives restart.
+    /// Blocks through the `Clock` trait, so it is instant under `TestClock`.
+    ///
+    /// # Errors
+    /// `Nondeterminism` if the journal expected a different command at this
+    /// position. `Journal` if the store cannot be reached.
+    pub fn sleep_until(&mut self, deadline: Deadline) -> Result<(), EngineError> {
+        let seq = self.seq;
+        self.seq = self.seq.next();
+
+        let decision = match &mut self.mode {
+            Mode::Replaying(cursor) => match cursor.peek().cloned() {
+                Some(JournalEvent::TimerScheduled {
+                    deadline: journaled,
+                    ..
+                }) if journaled == deadline => {
+                    cursor.advance();
+                    match cursor.peek().cloned() {
+                        Some(JournalEvent::TimerFired { .. }) => {
+                            cursor.advance();
+                            SleepDecision::UseRecorded(Ok(()))
+                        }
+                        Some(event) => {
+                            let expected = event.command_kind().unwrap_or(CommandKind::Sleep);
+                            SleepDecision::UseRecorded(Err(EngineError::Nondeterminism {
+                                seq,
+                                expected,
+                                got: CommandKind::Sleep,
+                            }))
+                        }
+                        None => SleepDecision::Rearm,
+                    }
+                }
+                Some(event) => {
+                    let expected = event.command_kind().unwrap_or(CommandKind::Sleep);
+                    SleepDecision::UseRecorded(Err(EngineError::Nondeterminism {
+                        seq,
+                        expected,
+                        got: CommandKind::Sleep,
+                    }))
+                }
+                None => SleepDecision::RunLive,
+            },
+            Mode::Live => SleepDecision::RunLive,
+        };
+
+        match decision {
+            SleepDecision::UseRecorded(result) => result,
+            SleepDecision::Rearm => {
+                self.mode = Mode::Live;
+                self.clock.sleep_until(deadline.timestamp());
+                self.store
+                    .append(&self.execution, JournalEvent::TimerFired { seq })
+                    .map_err(EngineError::from)?;
+                Ok(())
+            }
+            SleepDecision::RunLive => {
+                self.mode = Mode::Live;
+                self.store
+                    .append(
+                        &self.execution,
+                        JournalEvent::TimerScheduled { seq, deadline },
+                    )
+                    .map_err(EngineError::from)?;
+                self.clock.sleep_until(deadline.timestamp());
+                self.store
+                    .append(&self.execution, JournalEvent::TimerFired { seq })
+                    .map_err(EngineError::from)?;
+                Ok(())
             }
         }
     }
@@ -368,6 +455,8 @@ impl<'a, S: JournalStore> WorkflowCtx<'a, S> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::*;
     use crate::random::RandomBytes;
     use crate::random::RngSource;
@@ -383,6 +472,33 @@ mod tests {
     impl RngSource for FixedRng {
         fn next_bytes(&mut self) -> RandomBytes {
             RandomBytes::new(self.bytes)
+        }
+    }
+
+    /// Records the deadline it was told to sleep toward, without ever
+    /// blocking. This lets `sleep_until` tests assert what the engine asked
+    /// the clock to wait for.
+    struct RecordingClock {
+        now: Timestamp,
+        slept_until: RefCell<Option<Timestamp>>,
+    }
+
+    impl RecordingClock {
+        fn at(now: Timestamp) -> Self {
+            Self {
+                now,
+                slept_until: RefCell::new(None),
+            }
+        }
+    }
+
+    impl Clock for RecordingClock {
+        fn now(&self) -> Timestamp {
+            self.now
+        }
+
+        fn sleep_until(&self, deadline: Timestamp) {
+            *self.slept_until.borrow_mut() = Some(deadline);
         }
     }
 
@@ -1094,6 +1210,250 @@ mod tests {
                 expected: CommandKind::RunStep,
                 got: CommandKind::DrawRandom,
             })
+        );
+    }
+
+    #[test]
+    fn live_sleep_until_journals_the_timer_and_waits_for_the_deadline() {
+        let store = MemoryJournal::new();
+        let execution = signup_execution();
+        let clock = RecordingClock::at(Timestamp::from_millis_since_epoch(0));
+        let mut rng = unused_rng();
+        let mut ctx = WorkflowCtx::new(
+            &store,
+            execution,
+            ReplayCursor::new(Journal::empty()),
+            &clock,
+            &mut rng,
+        );
+        let deadline = Deadline::at(charge_renewal_deadline());
+
+        let result = ctx.sleep_until(deadline);
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(*clock.slept_until.borrow(), Some(charge_renewal_deadline()));
+        let journal = store.load(&execution).unwrap();
+        assert_eq!(
+            journal.events(),
+            &[
+                JournalEvent::TimerScheduled {
+                    seq: Seq::zero(),
+                    deadline,
+                },
+                JournalEvent::TimerFired { seq: Seq::zero() },
+            ]
+        );
+    }
+
+    #[test]
+    fn replaying_timer_scheduled_and_fired_returns_ok_without_sleeping() {
+        let store = MemoryJournal::new();
+        let execution = signup_execution();
+        let deadline = Deadline::at(charge_renewal_deadline());
+        let journal = Journal::new(vec![
+            JournalEvent::TimerScheduled {
+                seq: Seq::zero(),
+                deadline,
+            },
+            JournalEvent::TimerFired { seq: Seq::zero() },
+        ]);
+        let clock = RecordingClock::at(Timestamp::from_millis_since_epoch(0));
+        let mut rng = unused_rng();
+        let mut ctx = WorkflowCtx::new(
+            &store,
+            execution,
+            ReplayCursor::new(journal),
+            &clock,
+            &mut rng,
+        );
+
+        let result = ctx.sleep_until(deadline);
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(*clock.slept_until.borrow(), None);
+    }
+
+    #[test]
+    fn replaying_timer_deadline_mismatch_returns_nondeterminism_error() {
+        let store = MemoryJournal::new();
+        let execution = signup_execution();
+        let journaled_deadline = Deadline::at(charge_renewal_deadline());
+        let journal = Journal::new(vec![JournalEvent::TimerScheduled {
+            seq: Seq::zero(),
+            deadline: journaled_deadline,
+        }]);
+        let clock = unused_clock();
+        let mut rng = unused_rng();
+        let mut ctx = WorkflowCtx::new(
+            &store,
+            execution,
+            ReplayCursor::new(journal),
+            &clock,
+            &mut rng,
+        );
+        let different_deadline = Deadline::at(Timestamp::from_millis_since_epoch(0));
+
+        let result = ctx.sleep_until(different_deadline);
+
+        assert_eq!(
+            result,
+            Err(EngineError::Nondeterminism {
+                seq: Seq::zero(),
+                expected: CommandKind::Sleep,
+                got: CommandKind::Sleep,
+            })
+        );
+    }
+
+    #[test]
+    fn replaying_timer_with_mismatched_event_returns_nondeterminism_error() {
+        // Journal recorded a step at this position, code now asks to sleep.
+        let store = MemoryJournal::new();
+        let execution = signup_execution();
+        let journal = Journal::new(vec![JournalEvent::StepScheduled {
+            seq: Seq::zero(),
+            name: charge_card(),
+        }]);
+        let clock = unused_clock();
+        let mut rng = unused_rng();
+        let mut ctx = WorkflowCtx::new(
+            &store,
+            execution,
+            ReplayCursor::new(journal),
+            &clock,
+            &mut rng,
+        );
+
+        let result = ctx.sleep_until(Deadline::at(charge_renewal_deadline()));
+
+        assert_eq!(
+            result,
+            Err(EngineError::Nondeterminism {
+                seq: Seq::zero(),
+                expected: CommandKind::RunStep,
+                got: CommandKind::Sleep,
+            })
+        );
+    }
+
+    #[test]
+    fn replaying_timer_scheduled_followed_by_wrong_event_is_nondeterminism() {
+        let store = MemoryJournal::new();
+        let execution = signup_execution();
+        let deadline = Deadline::at(charge_renewal_deadline());
+        let journal = Journal::new(vec![
+            JournalEvent::TimerScheduled {
+                seq: Seq::zero(),
+                deadline,
+            },
+            JournalEvent::ExecutionCompleted {
+                output: EventPayload::new(b"done".to_vec()),
+            },
+        ]);
+        let clock = unused_clock();
+        let mut rng = unused_rng();
+        let mut ctx = WorkflowCtx::new(
+            &store,
+            execution,
+            ReplayCursor::new(journal),
+            &clock,
+            &mut rng,
+        );
+
+        let result = ctx.sleep_until(deadline);
+
+        assert_eq!(
+            result,
+            Err(EngineError::Nondeterminism {
+                seq: Seq::zero(),
+                expected: CommandKind::Sleep,
+                got: CommandKind::Sleep,
+            })
+        );
+    }
+
+    #[test]
+    fn replaying_timer_scheduled_with_no_further_events_rearms_the_timer() {
+        // The process died between TimerScheduled and TimerFired. Recovery
+        // must not re-append TimerScheduled. It only waits out the
+        // already-journaled deadline and journal TimerFired.
+        let store = MemoryJournal::new();
+        let execution = signup_execution();
+        let deadline = Deadline::at(charge_renewal_deadline());
+        let journal = Journal::new(vec![JournalEvent::TimerScheduled {
+            seq: Seq::zero(),
+            deadline,
+        }]);
+        let clock = RecordingClock::at(Timestamp::from_millis_since_epoch(0));
+        let mut rng = unused_rng();
+        let mut ctx = WorkflowCtx::new(
+            &store,
+            execution,
+            ReplayCursor::new(journal),
+            &clock,
+            &mut rng,
+        );
+
+        let result = ctx.sleep_until(deadline);
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(*clock.slept_until.borrow(), Some(charge_renewal_deadline()));
+        let journal = store.load(&execution).unwrap();
+        assert_eq!(
+            journal.events(),
+            &[JournalEvent::TimerFired { seq: Seq::zero() }]
+        );
+    }
+
+    #[test]
+    fn replaying_timer_cursor_exhausted_switches_to_live() {
+        let store = MemoryJournal::new();
+        let execution = signup_execution();
+        let journal = Journal::new(vec![
+            JournalEvent::StepScheduled {
+                seq: Seq::zero(),
+                name: charge_card(),
+            },
+            JournalEvent::StepStarted {
+                seq: Seq::zero(),
+                attempt: Attempt::first(),
+            },
+            JournalEvent::StepCompleted {
+                seq: Seq::zero(),
+                result: charge_confirmation(),
+            },
+        ]);
+        let clock = RecordingClock::at(Timestamp::from_millis_since_epoch(0));
+        let mut rng = unused_rng();
+        let mut ctx = WorkflowCtx::new(
+            &store,
+            execution,
+            ReplayCursor::new(journal),
+            &clock,
+            &mut rng,
+        );
+        let replayed = ctx.step(charge_card(), |_key| {
+            panic!("closure must not run during replay")
+        });
+        assert_eq!(replayed, Ok(charge_confirmation()));
+        let deadline = Deadline::at(charge_renewal_deadline());
+
+        let result = ctx.sleep_until(deadline);
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(*clock.slept_until.borrow(), Some(charge_renewal_deadline()));
+        let journal = store.load(&execution).unwrap();
+        assert_eq!(
+            journal.events(),
+            &[
+                JournalEvent::TimerScheduled {
+                    seq: Seq::zero().next(),
+                    deadline,
+                },
+                JournalEvent::TimerFired {
+                    seq: Seq::zero().next(),
+                },
+            ]
         );
     }
 
