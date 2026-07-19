@@ -32,26 +32,30 @@ use yaoki::random::RandomBytes;
 use yaoki::random::RngSource;
 use yaoki::step::StepName;
 use yaoki::stores::file::FileJournal;
+use yaoki::time::SystemClock;
 
 /// Deterministic execution identity for demo/test runs: derives 32 seed
-/// bytes from a CLI-supplied label, not from ambient randomness.
+/// bytes from a CLI-supplied label, not from ambient randomness. Reused as
+/// the workflow's `RngSource` too, though this demo never calls
+/// `ctx.random()`.
 struct SeededRng {
     seed: [u8; 32],
+}
+
+impl SeededRng {
+    fn from_label(label: &str) -> Self {
+        let mut seed = [0u8; 32];
+        for (slot, byte) in seed.iter_mut().zip(label.bytes()) {
+            *slot = byte;
+        }
+        Self { seed }
+    }
 }
 
 impl RngSource for SeededRng {
     fn next_bytes(&mut self) -> RandomBytes {
         RandomBytes::new(self.seed)
     }
-}
-
-fn execution_id_from_seed(label: &str) -> ExecutionId {
-    let mut seed = [0u8; 32];
-    for (slot, byte) in seed.iter_mut().zip(label.bytes()) {
-        *slot = byte;
-    }
-    let mut rng = SeededRng { seed };
-    ExecutionId::generate(&mut rng)
 }
 
 fn append_line(path: &Path, line: &str) {
@@ -123,7 +127,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let after_effect_marker = PathBuf::from(args.next().expect(usage));
 
     let store = FileJournal::new(&journal_dir)?;
-    let execution = execution_id_from_seed(&seed);
+    let mut rng = SeededRng::from_label(&seed);
+    let execution = ExecutionId::generate(&mut rng);
+    let clock = SystemClock;
     let workflow = SignupWorkflow {
         effect_trace,
         after_effect_marker,
@@ -133,9 +139,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let engine = Engine::new(&store);
     let journal = store.load(&execution)?;
     let result = if journal.is_empty() {
-        engine.run(execution, &workflow, input)
+        engine.run(execution, &workflow, input, &clock, &mut rng)
     } else {
-        engine.recover_and_run(execution, &workflow, input)
+        engine.recover_and_run(execution, &workflow, input, &clock, &mut rng)
     };
 
     match result {

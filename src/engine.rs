@@ -16,6 +16,8 @@ use crate::journal::EventPayload;
 use crate::journal::Journal;
 use crate::journal::JournalEvent;
 use crate::journal::JournalStore;
+use crate::random::RngSource;
+use crate::time::Clock;
 
 /// Journal empty: no `ExecutionStarted` yet.
 pub struct Created;
@@ -216,11 +218,19 @@ impl<'a, S: JournalStore> Engine<'a, S> {
         id: ExecutionId,
         workflow: &W,
         input: EventPayload,
+        clock: &dyn Clock,
+        rng: &mut dyn RngSource,
     ) -> Result<EventPayload, RunError<W::Error>> {
         let execution = Execution::new(self.store, id)
             .start(workflow.name(), workflow.version(), input.clone())
             .map_err(RunError::Engine)?;
-        let mut ctx = WorkflowCtx::new(self.store, id, ReplayCursor::new(Journal::empty()));
+        let mut ctx = WorkflowCtx::new(
+            self.store,
+            id,
+            ReplayCursor::new(Journal::empty()),
+            clock,
+            rng,
+        );
         Self::finish(execution, &mut ctx, workflow, input)
     }
 
@@ -232,12 +242,14 @@ impl<'a, S: JournalStore> Engine<'a, S> {
         id: ExecutionId,
         workflow: &W,
         input: EventPayload,
+        clock: &dyn Clock,
+        rng: &mut dyn RngSource,
     ) -> Result<EventPayload, RunError<W::Error>> {
         match Execution::recover(self.store, id, &workflow.version()).map_err(RunError::Engine)? {
             RecoveredExecution::AlreadyCompleted(_, output) => Ok(output),
             RecoveredExecution::AlreadyFailed(_, error) => Err(RunError::Recovered(error)),
             RecoveredExecution::StillRunning(execution, cursor) => {
-                let mut ctx = WorkflowCtx::new(self.store, id, cursor);
+                let mut ctx = WorkflowCtx::new(self.store, id, cursor, clock, rng);
                 Self::finish(execution, &mut ctx, workflow, input)
             }
         }
@@ -273,6 +285,8 @@ mod tests {
     use crate::step::StepErrorRecord;
     use crate::step::StepName;
     use crate::stores::memory::MemoryJournal;
+    use crate::time::TestClock;
+    use crate::time::Timestamp;
 
     struct FixedRng {
         bytes: [u8; 32],
@@ -301,6 +315,17 @@ mod tests {
 
     fn signup_input() -> EventPayload {
         EventPayload::new(br#"{"email":"john.smith@example.com"}"#.to_vec())
+    }
+
+    /// Neither `SignupWorkflow` nor `AlwaysFailsWorkflow` call `ctx.now()`
+    /// or `ctx.random()`; these exist only to satisfy `Engine::run` /
+    /// `Engine::recover_and_run`'s signature.
+    fn unused_clock() -> TestClock {
+        TestClock::at(Timestamp::from_millis_since_epoch(1_753_401_600_000))
+    }
+
+    fn unused_rng() -> FixedRng {
+        FixedRng { bytes: [0u8; 32] }
     }
 
     /// Two steps: `charge-card` then `create-account`, each returning its
@@ -534,7 +559,13 @@ mod tests {
         let execution = signup_execution();
 
         let output = engine
-            .run(execution, &SignupWorkflow, signup_input())
+            .run(
+                execution,
+                &SignupWorkflow,
+                signup_input(),
+                &unused_clock(),
+                &mut unused_rng(),
+            )
             .unwrap();
 
         assert_eq!(
@@ -556,7 +587,13 @@ mod tests {
         let engine = Engine::new(&store);
         let execution = signup_execution();
 
-        let result = engine.run(execution, &AlwaysFailsWorkflow, signup_input());
+        let result = engine.run(
+            execution,
+            &AlwaysFailsWorkflow,
+            signup_input(),
+            &unused_clock(),
+            &mut unused_rng(),
+        );
 
         assert!(matches!(result, Err(RunError::Workflow(_))));
         let journal = engine.store().load(&execution).unwrap();
@@ -575,7 +612,13 @@ mod tests {
         let first_output = {
             let engine = Engine::new(&store);
             engine
-                .run(execution, &SignupWorkflow, signup_input())
+                .run(
+                    execution,
+                    &SignupWorkflow,
+                    signup_input(),
+                    &unused_clock(),
+                    &mut unused_rng(),
+                )
                 .unwrap()
         };
         let events_after_first_run = store.load(&execution).unwrap().len();
@@ -585,7 +628,13 @@ mod tests {
         // fresh `Engine` over the same `store` binding and recover.
         let recovered_engine = Engine::new(&store);
         let second_output = recovered_engine
-            .recover_and_run(execution, &SignupWorkflow, signup_input())
+            .recover_and_run(
+                execution,
+                &SignupWorkflow,
+                signup_input(),
+                &unused_clock(),
+                &mut unused_rng(),
+            )
             .unwrap();
 
         // Identical output, and not a single event was re-appended
@@ -637,7 +686,13 @@ mod tests {
 
         let engine = Engine::new(&store);
         let output = engine
-            .recover_and_run(execution, &SignupWorkflow, signup_input())
+            .recover_and_run(
+                execution,
+                &SignupWorkflow,
+                signup_input(),
+                &unused_clock(),
+                &mut unused_rng(),
+            )
             .unwrap();
 
         // Charge-card was not re-run (its result came from the

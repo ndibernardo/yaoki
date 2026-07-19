@@ -18,11 +18,15 @@ use crate::journal::JournalError;
 use crate::journal::JournalEvent;
 use crate::journal::JournalStore;
 use crate::journal::Seq;
+use crate::random::RandomBytes;
+use crate::random::RngSource;
 use crate::step::Attempt;
 use crate::step::IdempotencyKey;
 use crate::step::StepError;
 use crate::step::StepErrorRecord;
 use crate::step::StepName;
+use crate::time::Clock;
+use crate::time::Timestamp;
 
 /// Walks a loaded `Journal` command by command during replay.
 #[derive(Debug, Clone)]
@@ -105,6 +109,14 @@ enum ReplayedStep {
     Rerun,
 }
 
+/// What replay found at the cursor while resolving a `now()`/`random()`
+/// call: either a recorded terminal outcome, or replay has run out and the
+/// value must be drawn live.
+enum ReplayedEffect<T> {
+    Recorded(Result<T, EngineError>),
+    Live,
+}
+
 /// The only capability a workflow receives. Every effect goes through here
 /// so replay can intercept it.
 pub struct WorkflowCtx<'a, S: JournalStore> {
@@ -112,13 +124,21 @@ pub struct WorkflowCtx<'a, S: JournalStore> {
     execution: ExecutionId,
     seq: Seq,
     mode: Mode,
+    clock: &'a dyn Clock,
+    rng: &'a mut dyn RngSource,
 }
 
 impl<'a, S: JournalStore> WorkflowCtx<'a, S> {
     /// Builds a context over `cursor`. A cursor already exhausted (fresh
     /// execution, or one whose journal has just `ExecutionStarted`) starts
     /// live; otherwise replay begins from the cursor's first event.
-    pub fn new(store: &'a S, execution: ExecutionId, cursor: ReplayCursor) -> Self {
+    pub fn new(
+        store: &'a S,
+        execution: ExecutionId,
+        cursor: ReplayCursor,
+        clock: &'a dyn Clock,
+        rng: &'a mut dyn RngSource,
+    ) -> Self {
         let mode = if cursor.is_exhausted() {
             Mode::Live
         } else {
@@ -129,6 +149,90 @@ impl<'a, S: JournalStore> WorkflowCtx<'a, S> {
             execution,
             seq: Seq::zero(),
             mode,
+            clock,
+            rng,
+        }
+    }
+
+    /// Journaled clock read. Replay returns the original timestamp.
+    ///
+    /// # Errors
+    /// `Nondeterminism` if the journal expected a different command at this
+    /// position. `Journal` if the store cannot be reached.
+    pub fn now(&mut self) -> Result<Timestamp, EngineError> {
+        let seq = self.seq;
+        self.seq = self.seq.next();
+
+        let decision = match &mut self.mode {
+            Mode::Replaying(cursor) => match cursor.peek().cloned() {
+                Some(JournalEvent::NowRecorded { value, .. }) => {
+                    cursor.advance();
+                    ReplayedEffect::Recorded(Ok(value))
+                }
+                Some(event) => {
+                    let expected = event.command_kind().unwrap_or(CommandKind::ReadNow);
+                    ReplayedEffect::Recorded(Err(EngineError::Nondeterminism {
+                        seq,
+                        expected,
+                        got: CommandKind::ReadNow,
+                    }))
+                }
+                None => ReplayedEffect::Live,
+            },
+            Mode::Live => ReplayedEffect::Live,
+        };
+
+        match decision {
+            ReplayedEffect::Recorded(result) => result,
+            ReplayedEffect::Live => {
+                self.mode = Mode::Live;
+                let value = self.clock.now();
+                self.store
+                    .append(&self.execution, JournalEvent::NowRecorded { seq, value })
+                    .map_err(EngineError::from)?;
+                Ok(value)
+            }
+        }
+    }
+
+    /// Journaled randomness. Replay returns the original bytes.
+    ///
+    /// # Errors
+    /// `Nondeterminism` if the journal expected a different command at this
+    /// position. `Journal` if the store cannot be reached.
+    pub fn random(&mut self) -> Result<RandomBytes, EngineError> {
+        let seq = self.seq;
+        self.seq = self.seq.next();
+
+        let decision = match &mut self.mode {
+            Mode::Replaying(cursor) => match cursor.peek().cloned() {
+                Some(JournalEvent::RandomRecorded { value, .. }) => {
+                    cursor.advance();
+                    ReplayedEffect::Recorded(Ok(value))
+                }
+                Some(event) => {
+                    let expected = event.command_kind().unwrap_or(CommandKind::DrawRandom);
+                    ReplayedEffect::Recorded(Err(EngineError::Nondeterminism {
+                        seq,
+                        expected,
+                        got: CommandKind::DrawRandom,
+                    }))
+                }
+                None => ReplayedEffect::Live,
+            },
+            Mode::Live => ReplayedEffect::Live,
+        };
+
+        match decision {
+            ReplayedEffect::Recorded(result) => result,
+            ReplayedEffect::Live => {
+                self.mode = Mode::Live;
+                let value = self.rng.next_bytes();
+                self.store
+                    .append(&self.execution, JournalEvent::RandomRecorded { seq, value })
+                    .map_err(EngineError::from)?;
+                Ok(value)
+            }
         }
     }
 
@@ -269,6 +373,7 @@ mod tests {
     use crate::random::RngSource;
     use crate::stores::memory::MemoryJournal;
     use crate::time::Deadline;
+    use crate::time::TestClock;
     use crate::time::Timestamp;
 
     struct FixedRng {
@@ -286,6 +391,26 @@ mod tests {
         bytes[0] = 0x51; // 'Q', arbitrary deterministic marker
         let mut rng = FixedRng { bytes };
         ExecutionId::generate(&mut rng)
+    }
+
+    /// Fixed clock reading for `step()` tests, which never call `ctx.now()`.
+    fn unused_clock() -> TestClock {
+        TestClock::at(Timestamp::from_millis_since_epoch(1_753_401_600_000))
+    }
+
+    /// Fixed rng draw for `step()` tests, which never call `ctx.random()`.
+    fn unused_rng() -> FixedRng {
+        FixedRng { bytes: [0u8; 32] }
+    }
+
+    fn charge_renewal_deadline() -> Timestamp {
+        Timestamp::from_millis_since_epoch(1_753_401_600_000)
+    }
+
+    fn charge_renewal_bytes() -> [u8; 32] {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x52; // 'R', arbitrary deterministic marker
+        bytes
     }
 
     fn charge_card() -> StepName {
@@ -318,7 +443,15 @@ mod tests {
     fn live_step_with_ok_closure_journals_and_returns_the_result() {
         let store = MemoryJournal::new();
         let execution = signup_execution();
-        let mut ctx = WorkflowCtx::new(&store, execution, ReplayCursor::new(Journal::empty()));
+        let clock = unused_clock();
+        let mut rng = unused_rng();
+        let mut ctx = WorkflowCtx::new(
+            &store,
+            execution,
+            ReplayCursor::new(Journal::empty()),
+            &clock,
+            &mut rng,
+        );
 
         let result = ctx.step(charge_card(), |_key| Ok(charge_confirmation()));
 
@@ -347,7 +480,15 @@ mod tests {
     fn live_step_with_err_closure_journals_step_failed() {
         let store = MemoryJournal::new();
         let execution = signup_execution();
-        let mut ctx = WorkflowCtx::new(&store, execution, ReplayCursor::new(Journal::empty()));
+        let clock = unused_clock();
+        let mut rng = unused_rng();
+        let mut ctx = WorkflowCtx::new(
+            &store,
+            execution,
+            ReplayCursor::new(Journal::empty()),
+            &clock,
+            &mut rng,
+        );
 
         let result = ctx.step(charge_card(), |_key| Err(gateway_timeout()));
 
@@ -377,7 +518,15 @@ mod tests {
     fn live_step_returns_journal_error_when_append_fails() {
         let store = AlwaysFailingJournal;
         let execution = signup_execution();
-        let mut ctx = WorkflowCtx::new(&store, execution, ReplayCursor::new(Journal::empty()));
+        let clock = unused_clock();
+        let mut rng = unused_rng();
+        let mut ctx = WorkflowCtx::new(
+            &store,
+            execution,
+            ReplayCursor::new(Journal::empty()),
+            &clock,
+            &mut rng,
+        );
 
         let result = ctx.step(charge_card(), |_key| Ok(charge_confirmation()));
 
@@ -407,7 +556,15 @@ mod tests {
                 result: charge_confirmation(),
             },
         ]);
-        let mut ctx = WorkflowCtx::new(&store, execution, ReplayCursor::new(journal));
+        let clock = unused_clock();
+        let mut rng = unused_rng();
+        let mut ctx = WorkflowCtx::new(
+            &store,
+            execution,
+            ReplayCursor::new(journal),
+            &clock,
+            &mut rng,
+        );
 
         let result = ctx.step(charge_card(), |_key| {
             panic!("closure must not run during replay of a completed step")
@@ -435,7 +592,15 @@ mod tests {
                 error: gateway_timeout(),
             },
         ]);
-        let mut ctx = WorkflowCtx::new(&store, execution, ReplayCursor::new(journal));
+        let clock = unused_clock();
+        let mut rng = unused_rng();
+        let mut ctx = WorkflowCtx::new(
+            &store,
+            execution,
+            ReplayCursor::new(journal),
+            &clock,
+            &mut rng,
+        );
 
         let result = ctx.step(charge_card(), |_key| {
             panic!("closure must not run during replay of a failed step")
@@ -453,7 +618,15 @@ mod tests {
             seq: Seq::zero(),
             deadline: Deadline::at(Timestamp::from_millis_since_epoch(1_753_401_600_000)),
         }]);
-        let mut ctx = WorkflowCtx::new(&store, execution, ReplayCursor::new(journal));
+        let clock = unused_clock();
+        let mut rng = unused_rng();
+        let mut ctx = WorkflowCtx::new(
+            &store,
+            execution,
+            ReplayCursor::new(journal),
+            &clock,
+            &mut rng,
+        );
 
         let result = ctx.step(charge_card(), |_key| {
             panic!("closure must not run when replay diverges")
@@ -478,7 +651,15 @@ mod tests {
             seq: Seq::zero(),
             name: StepName::new("create-account").unwrap(),
         }]);
-        let mut ctx = WorkflowCtx::new(&store, execution, ReplayCursor::new(journal));
+        let clock = unused_clock();
+        let mut rng = unused_rng();
+        let mut ctx = WorkflowCtx::new(
+            &store,
+            execution,
+            ReplayCursor::new(journal),
+            &clock,
+            &mut rng,
+        );
 
         let result = ctx.step(charge_card(), |_key| {
             panic!("closure must not run when replay diverges")
@@ -514,7 +695,15 @@ mod tests {
                 result: charge_confirmation(),
             },
         ]);
-        let mut ctx = WorkflowCtx::new(&store, execution, ReplayCursor::new(journal));
+        let clock = unused_clock();
+        let mut rng = unused_rng();
+        let mut ctx = WorkflowCtx::new(
+            &store,
+            execution,
+            ReplayCursor::new(journal),
+            &clock,
+            &mut rng,
+        );
         let replayed = ctx.step(charge_card(), |_key| {
             panic!("closure must not run during replay")
         });
@@ -561,7 +750,15 @@ mod tests {
                 attempt: Attempt::first(),
             },
         ]);
-        let mut ctx = WorkflowCtx::new(&store, execution, ReplayCursor::new(journal));
+        let clock = unused_clock();
+        let mut rng = unused_rng();
+        let mut ctx = WorkflowCtx::new(
+            &store,
+            execution,
+            ReplayCursor::new(journal),
+            &clock,
+            &mut rng,
+        );
 
         let result = ctx.step(charge_card(), |_key| Ok(charge_confirmation()));
 
@@ -599,7 +796,15 @@ mod tests {
             seq: Seq::zero(),
             name: charge_card(),
         }]);
-        let mut ctx = WorkflowCtx::new(&store, execution, ReplayCursor::new(journal));
+        let clock = unused_clock();
+        let mut rng = unused_rng();
+        let mut ctx = WorkflowCtx::new(
+            &store,
+            execution,
+            ReplayCursor::new(journal),
+            &clock,
+            &mut rng,
+        );
 
         let result = ctx.step(charge_card(), |_key| Ok(charge_confirmation()));
 
@@ -628,7 +833,15 @@ mod tests {
                 output: EventPayload::new(b"done".to_vec()),
             },
         ]);
-        let mut ctx = WorkflowCtx::new(&store, execution, ReplayCursor::new(journal));
+        let clock = unused_clock();
+        let mut rng = unused_rng();
+        let mut ctx = WorkflowCtx::new(
+            &store,
+            execution,
+            ReplayCursor::new(journal),
+            &clock,
+            &mut rng,
+        );
 
         let result = ctx.step(charge_card(), |_key| Ok(charge_confirmation()));
 
@@ -646,7 +859,15 @@ mod tests {
     fn idempotency_key_passed_to_the_closure_pairs_execution_and_seq() {
         let store = MemoryJournal::new();
         let execution = signup_execution();
-        let mut ctx = WorkflowCtx::new(&store, execution, ReplayCursor::new(Journal::empty()));
+        let clock = unused_clock();
+        let mut rng = unused_rng();
+        let mut ctx = WorkflowCtx::new(
+            &store,
+            execution,
+            ReplayCursor::new(Journal::empty()),
+            &clock,
+            &mut rng,
+        );
 
         let mut observed_key = None;
         let _ = ctx.step(charge_card(), |key| {
@@ -657,6 +878,223 @@ mod tests {
         let key = observed_key.unwrap();
         assert_eq!(key.execution(), execution);
         assert_eq!(key.seq(), Seq::zero());
+    }
+
+    #[test]
+    fn live_now_journals_the_clock_reading_and_returns_it() {
+        let store = MemoryJournal::new();
+        let execution = signup_execution();
+        let clock = TestClock::at(charge_renewal_deadline());
+        let mut rng = unused_rng();
+        let mut ctx = WorkflowCtx::new(
+            &store,
+            execution,
+            ReplayCursor::new(Journal::empty()),
+            &clock,
+            &mut rng,
+        );
+
+        let result = ctx.now();
+
+        assert_eq!(result, Ok(charge_renewal_deadline()));
+        let journal = store.load(&execution).unwrap();
+        assert_eq!(
+            journal.events(),
+            &[JournalEvent::NowRecorded {
+                seq: Seq::zero(),
+                value: charge_renewal_deadline(),
+            }]
+        );
+    }
+
+    #[test]
+    fn replaying_now_recorded_returns_the_recorded_timestamp_without_reading_the_clock() {
+        // The clock is set to a different instant than the one recorded, so
+        // a live read here would fail the assertion.
+        let store = MemoryJournal::new();
+        let execution = signup_execution();
+        let journal = Journal::new(vec![JournalEvent::NowRecorded {
+            seq: Seq::zero(),
+            value: charge_renewal_deadline(),
+        }]);
+        let clock = TestClock::at(Timestamp::from_millis_since_epoch(0));
+        let mut rng = unused_rng();
+        let mut ctx = WorkflowCtx::new(
+            &store,
+            execution,
+            ReplayCursor::new(journal),
+            &clock,
+            &mut rng,
+        );
+
+        let result = ctx.now();
+
+        assert_eq!(result, Ok(charge_renewal_deadline()));
+    }
+
+    #[test]
+    fn replaying_now_with_mismatched_event_returns_nondeterminism_error() {
+        // Journal recorded a step at this position, code now asks for the
+        // clock.
+        let store = MemoryJournal::new();
+        let execution = signup_execution();
+        let journal = Journal::new(vec![JournalEvent::StepScheduled {
+            seq: Seq::zero(),
+            name: charge_card(),
+        }]);
+        let clock = unused_clock();
+        let mut rng = unused_rng();
+        let mut ctx = WorkflowCtx::new(
+            &store,
+            execution,
+            ReplayCursor::new(journal),
+            &clock,
+            &mut rng,
+        );
+
+        let result = ctx.now();
+
+        assert_eq!(
+            result,
+            Err(EngineError::Nondeterminism {
+                seq: Seq::zero(),
+                expected: CommandKind::RunStep,
+                got: CommandKind::ReadNow,
+            })
+        );
+    }
+
+    #[test]
+    fn replaying_now_cursor_exhausted_switches_to_live() {
+        // Journal has exactly one recorded step; a now() call after
+        // replaying it must find replay exhausted and go live.
+        let store = MemoryJournal::new();
+        let execution = signup_execution();
+        let journal = Journal::new(vec![
+            JournalEvent::StepScheduled {
+                seq: Seq::zero(),
+                name: charge_card(),
+            },
+            JournalEvent::StepStarted {
+                seq: Seq::zero(),
+                attempt: Attempt::first(),
+            },
+            JournalEvent::StepCompleted {
+                seq: Seq::zero(),
+                result: charge_confirmation(),
+            },
+        ]);
+        let clock = TestClock::at(charge_renewal_deadline());
+        let mut rng = unused_rng();
+        let mut ctx = WorkflowCtx::new(
+            &store,
+            execution,
+            ReplayCursor::new(journal),
+            &clock,
+            &mut rng,
+        );
+        let replayed = ctx.step(charge_card(), |_key| {
+            panic!("closure must not run during replay")
+        });
+        assert_eq!(replayed, Ok(charge_confirmation()));
+
+        let result = ctx.now();
+
+        assert_eq!(result, Ok(charge_renewal_deadline()));
+        let journal = store.load(&execution).unwrap();
+        assert_eq!(
+            journal.events(),
+            &[JournalEvent::NowRecorded {
+                seq: Seq::zero().next(),
+                value: charge_renewal_deadline(),
+            }]
+        );
+    }
+
+    #[test]
+    fn live_random_journals_the_drawn_bytes_and_returns_them() {
+        let store = MemoryJournal::new();
+        let execution = signup_execution();
+        let clock = unused_clock();
+        let mut rng = FixedRng {
+            bytes: charge_renewal_bytes(),
+        };
+        let mut ctx = WorkflowCtx::new(
+            &store,
+            execution,
+            ReplayCursor::new(Journal::empty()),
+            &clock,
+            &mut rng,
+        );
+
+        let result = ctx.random();
+
+        assert_eq!(result, Ok(RandomBytes::new(charge_renewal_bytes())));
+        let journal = store.load(&execution).unwrap();
+        assert_eq!(
+            journal.events(),
+            &[JournalEvent::RandomRecorded {
+                seq: Seq::zero(),
+                value: RandomBytes::new(charge_renewal_bytes()),
+            }]
+        );
+    }
+
+    #[test]
+    fn replaying_random_recorded_returns_the_recorded_bytes_without_drawing() {
+        // The rng is set to draw different bytes than the ones recorded, so
+        // a live draw here would fail the assertion.
+        let store = MemoryJournal::new();
+        let execution = signup_execution();
+        let journal = Journal::new(vec![JournalEvent::RandomRecorded {
+            seq: Seq::zero(),
+            value: RandomBytes::new(charge_renewal_bytes()),
+        }]);
+        let clock = unused_clock();
+        let mut rng = FixedRng { bytes: [0u8; 32] };
+        let mut ctx = WorkflowCtx::new(
+            &store,
+            execution,
+            ReplayCursor::new(journal),
+            &clock,
+            &mut rng,
+        );
+
+        let result = ctx.random();
+
+        assert_eq!(result, Ok(RandomBytes::new(charge_renewal_bytes())));
+    }
+
+    #[test]
+    fn replaying_random_with_mismatched_event_returns_nondeterminism_error() {
+        // Journal recorded a step at this position, code now asks to draw
+        // randomness.
+        let store = MemoryJournal::new();
+        let execution = signup_execution();
+        let journal = Journal::new(vec![JournalEvent::StepScheduled {
+            seq: Seq::zero(),
+            name: charge_card(),
+        }]);
+        let clock = unused_clock();
+        let mut rng = unused_rng();
+        let mut ctx = WorkflowCtx::new(
+            &store,
+            execution,
+            ReplayCursor::new(journal),
+            &clock,
+            &mut rng,
+        );
+
+        let result = ctx.random();
+
+        assert_eq!(
+            result,
+            Err(EngineError::Nondeterminism {
+                seq: Seq::zero(),
+                expected: CommandKind::RunStep,
+                got: CommandKind::DrawRandom,
+            })
+        );
     }
 
     #[test]
