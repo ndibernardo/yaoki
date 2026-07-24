@@ -19,6 +19,7 @@ use yaoki::engine::Engine;
 use yaoki::engine::Execution;
 use yaoki::engine::RunError;
 use yaoki::engine::Workflow;
+use yaoki::equivalence::DuplicateLast;
 use yaoki::execution::ExecutionId;
 use yaoki::execution::WorkflowName;
 use yaoki::execution::WorkflowVersion;
@@ -239,7 +240,7 @@ fn recovery_branching_on_ambient_time_with_a_different_step_name_is_nondetermini
     let execution = renewal_execution();
     seed_crashed_run_after_charge_renewal(&store, execution);
 
-    let engine = Engine::new(&store);
+    let engine = Engine::<_, DuplicateLast>::new(&store);
     let workflow = AmbientTimeBranchWorkflow {
         ambient_now: after_deadline_timestamp(),
         past_deadline_command: PastDeadlineCommand::DifferentStepName,
@@ -274,7 +275,7 @@ fn recovery_branching_on_ambient_time_reading_now_instead_of_a_step_is_nondeterm
     let execution = renewal_execution();
     seed_crashed_run_after_charge_renewal(&store, execution);
 
-    let engine = Engine::new(&store);
+    let engine = Engine::<_, DuplicateLast>::new(&store);
     let workflow = AmbientTimeBranchWorkflow {
         ambient_now: after_deadline_timestamp(),
         past_deadline_command: PastDeadlineCommand::ReadNowInstead,
@@ -356,7 +357,7 @@ fn recovery_branching_on_ctx_now_replays_the_journaled_time_and_completes_under_
     // read this instead of the journaled `NowRecorded`, it would diverge
     // against the recorded `charge-renewal` step.
     let recovery_clock = TestClock::at(after_deadline_timestamp());
-    let engine = Engine::new(&store);
+    let engine = Engine::<_, DuplicateLast>::new(&store);
 
     let result = engine.recover_and_run(
         execution,

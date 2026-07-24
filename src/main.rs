@@ -23,6 +23,7 @@ use yaoki::context::WorkflowCtx;
 use yaoki::engine::Engine;
 use yaoki::engine::RunError;
 use yaoki::engine::Workflow;
+use yaoki::equivalence::DuplicateLast;
 use yaoki::execution::ExecutionId;
 use yaoki::execution::WorkflowName;
 use yaoki::execution::WorkflowVersion;
@@ -136,7 +137,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     let input = EventPayload::new(br#"{"email":"john.smith@example.com"}"#.to_vec());
 
-    let engine = Engine::new(&store);
+    let engine = Engine::<_, DuplicateLast>::new(&store);
     let journal = store.load(&execution)?;
     let result = if journal.is_empty() {
         engine.run(execution, &workflow, input, &clock, &mut rng)

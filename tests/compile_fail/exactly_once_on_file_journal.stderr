@@ -1,0 +1,37 @@
+error[E0277]: the trait bound `FileJournal: TransactionalBoundary` is not satisfied
+  --> tests/compile_fail/exactly_once_on_file_journal.rs:11:19
+   |
+11 |     let _engine = Engine::<FileJournal, ExactlyOnce>::new(&store);
+   |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `TransactionalBoundary` is not implemented for `FileJournal`
+   |
+help: the trait `TransactionalBoundary` is implemented for `MemoryJournal`
+  --> src/stores/memory.rs
+   |
+   | impl TransactionalBoundary for MemoryJournal {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: required for `ExactlyOnce` to implement `SupportedOn<FileJournal>`
+note: required by a bound in `yaoki::engine::Engine`
+  --> src/engine.rs
+   |
+   | pub struct Engine<'a, S: JournalStore, E: SupportedOn<S>> {
+   |                                           ^^^^^^^^^^^^^^ required by this bound in `Engine`
+
+error[E0599]: the associated function or constant `new` exists for struct `yaoki::engine::Engine<'_, FileJournal, ExactlyOnce>`, but its trait bounds were not satisfied
+  --> tests/compile_fail/exactly_once_on_file_journal.rs:11:55
+   |
+11 |     let _engine = Engine::<FileJournal, ExactlyOnce>::new(&store);
+   |                                                       ^^^ associated function or constant cannot be called due to unsatisfied trait bounds
+   |
+  ::: src/equivalence.rs
+   |
+   | pub struct ExactlyOnce;
+   | ---------------------- doesn't satisfy `ExactlyOnce: SupportedOn<FileJournal>`
+   |
+  ::: src/stores/file.rs
+   |
+   | pub struct FileJournal {
+   | ---------------------- doesn't satisfy `FileJournal: TransactionalBoundary`
+   |
+   = note: the following trait bounds were not satisfied:
+           `FileJournal: TransactionalBoundary`
+           which is required by `ExactlyOnce: SupportedOn<FileJournal>`

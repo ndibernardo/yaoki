@@ -1,0 +1,7 @@
+error[E0599]: no method named `start` found for struct `Execution<'_, MemoryJournal, Completed>` in the current scope
+  --> tests/compile_fail/completed_execution_cannot_start.rs:48:23
+   |
+48 |     let _ = completed.start(renewal_workflow_name(), renewal_workflow_version(), renewal_input());
+   |                       ^^^^^ method not found in `Execution<'_, MemoryJournal, Completed>`
+   |
+   = note: the method was found for `Execution<'a, S, Created>`

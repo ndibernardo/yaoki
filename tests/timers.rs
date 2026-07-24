@@ -14,6 +14,7 @@ use yaoki::context::WorkflowCtx;
 use yaoki::engine::Engine;
 use yaoki::engine::Execution;
 use yaoki::engine::Workflow;
+use yaoki::equivalence::DuplicateLast;
 use yaoki::execution::ExecutionId;
 use yaoki::execution::WorkflowName;
 use yaoki::execution::WorkflowVersion;
@@ -159,7 +160,7 @@ fn recovery_mid_timer_rearms_the_remainder_and_completes_the_workflow_live() {
         .unwrap();
 
     let recovery_clock = RecordingClock::at(Timestamp::from_millis_since_epoch(0));
-    let engine = Engine::new(&store);
+    let engine = Engine::<_, DuplicateLast>::new(&store);
     let workflow = RenewalTimerWorkflow { deadline };
 
     let result = engine.recover_and_run(
