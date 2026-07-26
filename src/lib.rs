@@ -5,6 +5,7 @@ pub mod context;
 pub mod engine;
 pub mod equivalence;
 pub mod execution;
+pub mod failpoints;
 pub mod journal;
 pub mod random;
 pub mod step;
