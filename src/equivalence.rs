@@ -73,9 +73,13 @@ pub trait SupportedOn<S: JournalStore>: Equivalence {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExactlyOnce;
 
-/// Recovery may duplicate at most the last effect of an interrupted step:
-/// the crash window between a side effect landing and `StepCompleted` being
-/// journaled.
+/// Recovery may duplicate at most one effect: the last one performed before
+/// the crash. The window is between a side effect landing and its
+/// `StepCompleted` becoming durable. Recovery cannot tell the effect
+/// happened, so it reruns the step and the effect lands a second time
+/// directly after the first. `Last` means last at the moment of the crash,
+/// not last in the trace: a crash on a middle step duplicates that step's
+/// effect in place, and the remaining steps still follow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DuplicateLast;
 
@@ -100,12 +104,20 @@ impl Equivalence for DuplicateLast {
         if observed == reference {
             return true;
         }
-        match (reference.records().last(), observed.records().split_last()) {
-            (Some(expected_last), Some((observed_last, observed_prefix))) => {
-                observed_prefix == reference.records() && observed_last == expected_last
-            }
-            _ => false,
+        if observed.records().len() != reference.records().len() + 1 {
+            return false;
         }
+        // One crash, one interrupted step: observed must be reference with
+        // exactly one of its effects repeated immediately after itself.
+        reference
+            .records()
+            .iter()
+            .enumerate()
+            .any(|(index, record)| {
+                let mut candidate: Vec<&EffectRecord> = reference.records().iter().collect();
+                candidate.insert(index, record);
+                candidate.into_iter().eq(observed.records().iter())
+            })
     }
 }
 
@@ -241,15 +253,47 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_last_fails_for_a_duplicate_in_the_middle_rather_than_the_tail() {
-        // charge-renewal duplicated where it happened, not at the trailing
-        // position. That is a different bug than the documented crash
-        // window, and DuplicateLast makes no promise about it.
+    fn duplicate_last_holds_for_an_interrupted_middle_step_duplicated_in_place() {
+        // Crashed after charge-renewal's effect landed but before its
+        // StepCompleted was durable: recovery reruns charge-renewal, then
+        // carries on to send-receipt.
         let reference = reference_trace();
         let mut observed = EffectTrace::new();
         observed.record(charge_renewal(), charge_renewal_confirmation());
         observed.record(charge_renewal(), charge_renewal_confirmation());
         observed.record(send_receipt(), send_receipt_confirmation());
+
+        assert!(DuplicateLast::equivalent(&observed, &reference));
+    }
+
+    #[test]
+    fn duplicate_last_fails_for_a_repeat_that_is_not_adjacent_to_its_original() {
+        // charge-renewal repeating after send-receipt is not a crash window.
+        // No single interrupted step produces this ordering.
+        let reference = reference_trace();
+        let mut observed = reference_trace();
+        observed.record(charge_renewal(), charge_renewal_confirmation());
+
+        assert!(!DuplicateLast::equivalent(&observed, &reference));
+    }
+
+    #[test]
+    fn duplicate_last_fails_for_two_duplicated_effects() {
+        let reference = reference_trace();
+        let mut observed = EffectTrace::new();
+        observed.record(charge_renewal(), charge_renewal_confirmation());
+        observed.record(charge_renewal(), charge_renewal_confirmation());
+        observed.record(send_receipt(), send_receipt_confirmation());
+        observed.record(send_receipt(), send_receipt_confirmation());
+
+        assert!(!DuplicateLast::equivalent(&observed, &reference));
+    }
+
+    #[test]
+    fn duplicate_last_fails_for_an_extra_effect_against_an_empty_reference() {
+        let reference = EffectTrace::new();
+        let mut observed = EffectTrace::new();
+        observed.record(charge_renewal(), charge_renewal_confirmation());
 
         assert!(!DuplicateLast::equivalent(&observed, &reference));
     }
