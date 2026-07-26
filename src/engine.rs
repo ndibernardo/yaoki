@@ -13,6 +13,9 @@ use crate::execution::ExecutionId;
 use crate::execution::WorkflowErrorRecord;
 use crate::execution::WorkflowName;
 use crate::execution::WorkflowVersion;
+use crate::failpoints::CrashStatus;
+use crate::failpoints::FailpointPolicy;
+use crate::failpoints::NeverCrash;
 use crate::journal::EventPayload;
 use crate::journal::Journal;
 use crate::journal::JournalEvent;
@@ -208,13 +211,25 @@ pub enum RunError<E> {
 /// impossibility before any workflow runs.
 pub struct Engine<'a, S: JournalStore, E: SupportedOn<S>> {
     store: &'a S,
+    failpoints: &'a dyn FailpointPolicy,
     _mode: PhantomData<E>,
 }
 
 impl<'a, S: JournalStore, E: SupportedOn<S>> Engine<'a, S, E> {
+    /// An engine that never simulates its own death.
     pub fn new(store: &'a S) -> Self {
+        Self::with_failpoints(store, &NeverCrash)
+    }
+
+    /// An engine whose live paths consult `failpoints` at every
+    /// `CrashPoint`. A fired failpoint aborts the run with
+    /// `EngineError::InjectedCrash` and journals no terminal event, so
+    /// recovering over the same store sees exactly what a killed process
+    /// would have left behind.
+    pub fn with_failpoints(store: &'a S, failpoints: &'a dyn FailpointPolicy) -> Self {
         Self {
             store,
+            failpoints,
             _mode: PhantomData,
         }
     }
@@ -235,12 +250,13 @@ impl<'a, S: JournalStore, E: SupportedOn<S>> Engine<'a, S, E> {
         let execution = Execution::new(self.store, id)
             .start(workflow.name(), workflow.version(), input.clone())
             .map_err(RunError::Engine)?;
-        let mut ctx = WorkflowCtx::new(
+        let mut ctx = WorkflowCtx::with_failpoints(
             self.store,
             id,
             ReplayCursor::new(Journal::empty()),
             clock,
             rng,
+            self.failpoints,
         );
         Self::finish(execution, &mut ctx, workflow, input)
     }
@@ -260,7 +276,14 @@ impl<'a, S: JournalStore, E: SupportedOn<S>> Engine<'a, S, E> {
             RecoveredExecution::AlreadyCompleted(_, output) => Ok(output),
             RecoveredExecution::AlreadyFailed(_, error) => Err(RunError::Recovered(error)),
             RecoveredExecution::StillRunning(execution, cursor) => {
-                let mut ctx = WorkflowCtx::new(self.store, id, cursor, clock, rng);
+                let mut ctx = WorkflowCtx::with_failpoints(
+                    self.store,
+                    id,
+                    cursor,
+                    clock,
+                    rng,
+                    self.failpoints,
+                );
                 Self::finish(execution, &mut ctx, workflow, input)
             }
         }
@@ -272,7 +295,19 @@ impl<'a, S: JournalStore, E: SupportedOn<S>> Engine<'a, S, E> {
         workflow: &W,
         input: EventPayload,
     ) -> Result<EventPayload, RunError<W::Error>> {
-        match workflow.run(ctx, input) {
+        let result = workflow.run(ctx, input);
+
+        // A fired failpoint stands for process death: nothing terminal may be
+        // journaled, whatever the workflow returned. A workflow that
+        // swallowed the crash error does not get to complete.
+        match ctx.crash_status() {
+            CrashStatus::Crashed(point) => {
+                return Err(RunError::Engine(EngineError::InjectedCrash(point)));
+            }
+            CrashStatus::Intact => {}
+        }
+
+        match result {
             Ok(output) => {
                 execution
                     .complete(output.clone())
