@@ -12,6 +12,11 @@ use thiserror::Error;
 use crate::command::CommandKind;
 use crate::execution::ExecutionId;
 use crate::execution::WorkflowVersion;
+use crate::failpoints::CrashPoint;
+use crate::failpoints::CrashStatus;
+use crate::failpoints::FailpointDecision;
+use crate::failpoints::FailpointPolicy;
+use crate::failpoints::NeverCrash;
 use crate::journal::EventPayload;
 use crate::journal::Journal;
 use crate::journal::JournalError;
@@ -80,6 +85,9 @@ pub enum EngineError {
 
     #[error("journal error: {0}")]
     Journal(#[from] JournalError),
+
+    #[error("injected crash at {0:?}")]
+    InjectedCrash(CrashPoint),
 }
 
 /// Replay-vs-live execution mode. Not a typestate: the transition happens
@@ -95,7 +103,18 @@ enum Mode {
 /// executed live.
 enum StepDecision {
     UseRecorded(Result<EventPayload, StepError>),
-    RunLive,
+    RunLive(LiveEntry),
+}
+
+/// How a live step run enters the journal.
+enum LiveEntry {
+    /// Nothing is journaled at this position: schedule the step, then start
+    /// its first attempt.
+    Fresh,
+    /// `StepScheduled` is already durable from an attempt a crash cut short.
+    /// Start a new attempt without re-scheduling. A second `StepScheduled` at
+    /// the same `Seq` would make every later replay ambiguous.
+    Retry { attempt: Attempt },
 }
 
 /// What replay found after matching a journaled `StepScheduled`.
@@ -103,11 +122,11 @@ enum ReplayedStep {
     /// A terminal outcome (`StepCompleted`/`StepFailed`, or a divergence).
     /// Answer from the journal, do not run the closure.
     Recorded(Result<EventPayload, StepError>),
-    /// `StepStarted` was journaled but nothing followed: the process died
-    /// mid-step, either before or after the side effect landed. The engine
-    /// cannot tell which, so it reruns; `DuplicateLast`/idempotency keys
-    /// absorb a duplicate effect.
-    Rerun,
+    /// The journal ends inside this step: the process died before any
+    /// outcome was recorded, either before or after the side effect landed.
+    /// The engine cannot tell which, so it reruns as `attempt`;
+    /// `DuplicateLast`/idempotency keys absorb a duplicate effect.
+    Rerun { attempt: Attempt },
 }
 
 /// What replay found at the cursor while resolving a `now()`/`random()`
@@ -140,18 +159,34 @@ pub struct WorkflowCtx<'a, S: JournalStore> {
     mode: Mode,
     clock: &'a dyn Clock,
     rng: &'a mut dyn RngSource,
+    failpoints: &'a dyn FailpointPolicy,
+    crash: CrashStatus,
 }
 
 impl<'a, S: JournalStore> WorkflowCtx<'a, S> {
-    /// Builds a context over `cursor`. A cursor already exhausted (fresh
-    /// execution, or one whose journal has just `ExecutionStarted`) starts
-    /// live; otherwise replay begins from the cursor's first event.
+    /// Builds a context over `cursor` that never crashes. A cursor already
+    /// exhausted (fresh execution, or one whose journal has just
+    /// `ExecutionStarted`) starts live; otherwise replay begins from the
+    /// cursor's first event.
     pub fn new(
         store: &'a S,
         execution: ExecutionId,
         cursor: ReplayCursor,
         clock: &'a dyn Clock,
         rng: &'a mut dyn RngSource,
+    ) -> Self {
+        Self::with_failpoints(store, execution, cursor, clock, rng, &NeverCrash)
+    }
+
+    /// Builds a context whose live paths consult `failpoints` at every
+    /// `CrashPoint`.
+    pub fn with_failpoints(
+        store: &'a S,
+        execution: ExecutionId,
+        cursor: ReplayCursor,
+        clock: &'a dyn Clock,
+        rng: &'a mut dyn RngSource,
+        failpoints: &'a dyn FailpointPolicy,
     ) -> Self {
         let mode = if cursor.is_exhausted() {
             Mode::Live
@@ -165,6 +200,37 @@ impl<'a, S: JournalStore> WorkflowCtx<'a, S> {
             mode,
             clock,
             rng,
+            failpoints,
+            crash: CrashStatus::Intact,
+        }
+    }
+
+    /// Whether an injected crash fired during this run.
+    pub fn crash_status(&self) -> CrashStatus {
+        self.crash
+    }
+
+    /// Consults the policy at `point`. On `Crash`, records the crash and
+    /// returns the error without journaling anything: the journal is left
+    /// exactly as a process death at this window would leave it.
+    fn checkpoint(&mut self, point: CrashPoint) -> Result<(), EngineError> {
+        match self.failpoints.at(point) {
+            FailpointDecision::Continue => Ok(()),
+            FailpointDecision::Crash => {
+                self.crash = CrashStatus::Crashed(point);
+                Err(EngineError::InjectedCrash(point))
+            }
+        }
+    }
+
+    /// A crashed process runs no further commands. Once a failpoint has
+    /// fired, every later `ctx` call fails with the same crash without
+    /// consuming a `Seq` or touching the journal, so a workflow that swallows
+    /// the first error cannot journal past its own death.
+    fn refuse_after_crash(&self) -> Result<(), EngineError> {
+        match self.crash {
+            CrashStatus::Intact => Ok(()),
+            CrashStatus::Crashed(point) => Err(EngineError::InjectedCrash(point)),
         }
     }
 
@@ -174,6 +240,7 @@ impl<'a, S: JournalStore> WorkflowCtx<'a, S> {
     /// `Nondeterminism` if the journal expected a different command at this
     /// position. `Journal` if the store cannot be reached.
     pub fn now(&mut self) -> Result<Timestamp, EngineError> {
+        self.refuse_after_crash()?;
         let seq = self.seq;
         self.seq = self.seq.next();
 
@@ -215,6 +282,7 @@ impl<'a, S: JournalStore> WorkflowCtx<'a, S> {
     /// `Nondeterminism` if the journal expected a different command at this
     /// position. `Journal` if the store cannot be reached.
     pub fn random(&mut self) -> Result<RandomBytes, EngineError> {
+        self.refuse_after_crash()?;
         let seq = self.seq;
         self.seq = self.seq.next();
 
@@ -257,6 +325,7 @@ impl<'a, S: JournalStore> WorkflowCtx<'a, S> {
     /// `Nondeterminism` if the journal expected a different command at this
     /// position. `Journal` if the store cannot be reached.
     pub fn sleep_until(&mut self, deadline: Deadline) -> Result<(), EngineError> {
+        self.refuse_after_crash()?;
         let seq = self.seq;
         self.seq = self.seq.next();
 
@@ -304,7 +373,7 @@ impl<'a, S: JournalStore> WorkflowCtx<'a, S> {
                 self.store
                     .append(&self.execution, JournalEvent::TimerFired { seq })
                     .map_err(EngineError::from)?;
-                Ok(())
+                self.checkpoint(CrashPoint::AfterTimerFired(seq))
             }
             SleepDecision::RunLive => {
                 self.mode = Mode::Live;
@@ -314,11 +383,12 @@ impl<'a, S: JournalStore> WorkflowCtx<'a, S> {
                         JournalEvent::TimerScheduled { seq, deadline },
                     )
                     .map_err(EngineError::from)?;
+                self.checkpoint(CrashPoint::AfterTimerScheduled(seq))?;
                 self.clock.sleep_until(deadline.timestamp());
                 self.store
                     .append(&self.execution, JournalEvent::TimerFired { seq })
                     .map_err(EngineError::from)?;
-                Ok(())
+                self.checkpoint(CrashPoint::AfterTimerFired(seq))
             }
         }
     }
@@ -329,6 +399,7 @@ impl<'a, S: JournalStore> WorkflowCtx<'a, S> {
     where
         F: FnOnce(IdempotencyKey) -> Result<EventPayload, StepErrorRecord>,
     {
+        self.refuse_after_crash().map_err(StepError::Engine)?;
         let seq = self.seq;
         self.seq = self.seq.next();
 
@@ -340,7 +411,9 @@ impl<'a, S: JournalStore> WorkflowCtx<'a, S> {
                     cursor.advance();
                     match Self::replay_step_outcome(cursor, seq) {
                         ReplayedStep::Recorded(result) => StepDecision::UseRecorded(result),
-                        ReplayedStep::Rerun => StepDecision::RunLive,
+                        ReplayedStep::Rerun { attempt } => {
+                            StepDecision::RunLive(LiveEntry::Retry { attempt })
+                        }
                     }
                 }
                 Some(event) => {
@@ -351,27 +424,31 @@ impl<'a, S: JournalStore> WorkflowCtx<'a, S> {
                         got: CommandKind::RunStep,
                     })))
                 }
-                None => StepDecision::RunLive,
+                None => StepDecision::RunLive(LiveEntry::Fresh),
             },
-            Mode::Live => StepDecision::RunLive,
+            Mode::Live => StepDecision::RunLive(LiveEntry::Fresh),
         };
 
         match decision {
             StepDecision::UseRecorded(result) => result,
-            StepDecision::RunLive => {
+            StepDecision::RunLive(entry) => {
                 self.mode = Mode::Live;
-                self.run_live(seq, name, f)
+                self.run_live(seq, name, f, entry)
             }
         }
     }
 
     /// Resolves a step already matched against a journaled `StepScheduled`:
-    /// consumes the following `StepStarted` (if present) and returns the
-    /// recorded `StepCompleted`/`StepFailed` outcome, or signals a rerun.
+    /// consumes the attempts that follow and returns the recorded
+    /// `StepCompleted`/`StepFailed` outcome, or signals a rerun.
     fn replay_step_outcome(cursor: &mut ReplayCursor, seq: Seq) -> ReplayedStep {
-        let started = matches!(cursor.peek(), Some(JournalEvent::StepStarted { .. }));
-        if started {
+        // Every `StepStarted` at this position is one attempt; a crash-cut
+        // attempt leaves its `StepStarted` behind with no outcome after it,
+        // so several can accumulate before one completes.
+        let mut attempts: u32 = 0;
+        while matches!(cursor.peek(), Some(JournalEvent::StepStarted { .. })) {
             cursor.advance();
+            attempts += 1;
         }
         match cursor.peek().cloned() {
             Some(JournalEvent::StepCompleted { result, .. }) => {
@@ -390,41 +467,48 @@ impl<'a, S: JournalStore> WorkflowCtx<'a, S> {
                     got: CommandKind::RunStep,
                 })))
             }
-            // `StepScheduled` alone, with no `StepStarted`, is not a
-            // documented crash window (`run_live` always appends both in
-            // the same call). Treat it as a divergence rather than a
-            // rerun.
-            None if started => ReplayedStep::Rerun,
-            None => ReplayedStep::Recorded(Err(StepError::Engine(EngineError::Nondeterminism {
-                seq,
-                expected: CommandKind::RunStep,
-                got: CommandKind::RunStep,
-            }))),
+            // Journal ends here: the process died mid-step, after
+            // `StepScheduled` (`CrashPoint::AfterStepScheduled`) or after
+            // `StepStarted` (`AfterStepStarted` / `AfterSideEffect`). No
+            // outcome was recorded either way, so rerun as the next attempt.
+            None => ReplayedStep::Rerun {
+                attempt: (0..attempts).fold(Attempt::first(), |attempt, _| attempt.next()),
+            },
         }
     }
 
-    /// Executes `f` for real: schedules, starts, runs, and journals the
-    /// outcome.
-    fn run_live<F>(&mut self, seq: Seq, name: StepName, f: F) -> Result<EventPayload, StepError>
+    /// Executes `f` for real: schedules (unless a crash-cut attempt already
+    /// did), starts, runs, and journals the outcome.
+    fn run_live<F>(
+        &mut self,
+        seq: Seq,
+        name: StepName,
+        f: F,
+        entry: LiveEntry,
+    ) -> Result<EventPayload, StepError>
     where
         F: FnOnce(IdempotencyKey) -> Result<EventPayload, StepErrorRecord>,
     {
+        let attempt = match entry {
+            LiveEntry::Fresh => {
+                self.checkpoint(CrashPoint::BeforeStepScheduled(seq))?;
+                self.store
+                    .append(&self.execution, JournalEvent::StepScheduled { seq, name })
+                    .map_err(EngineError::from)?;
+                self.checkpoint(CrashPoint::AfterStepScheduled(seq))?;
+                Attempt::first()
+            }
+            LiveEntry::Retry { attempt } => attempt,
+        };
         self.store
-            .append(&self.execution, JournalEvent::StepScheduled { seq, name })
+            .append(&self.execution, JournalEvent::StepStarted { seq, attempt })
             .map_err(EngineError::from)?;
-        self.store
-            .append(
-                &self.execution,
-                JournalEvent::StepStarted {
-                    seq,
-                    attempt: Attempt::first(),
-                },
-            )
-            .map_err(EngineError::from)?;
+        self.checkpoint(CrashPoint::AfterStepStarted(seq))?;
 
         let key = IdempotencyKey::new(self.execution, seq);
         match f(key) {
             Ok(result) => {
+                self.checkpoint(CrashPoint::AfterSideEffect(seq))?;
                 self.store
                     .append(
                         &self.execution,
@@ -434,6 +518,7 @@ impl<'a, S: JournalStore> WorkflowCtx<'a, S> {
                         },
                     )
                     .map_err(EngineError::from)?;
+                self.checkpoint(CrashPoint::AfterStepCompleted(seq))?;
                 Ok(result)
             }
             Err(error) => {
@@ -442,7 +527,7 @@ impl<'a, S: JournalStore> WorkflowCtx<'a, S> {
                         &self.execution,
                         JournalEvent::StepFailed {
                             seq,
-                            attempt: Attempt::first(),
+                            attempt,
                             error: error.clone(),
                         },
                     )
@@ -455,9 +540,11 @@ impl<'a, S: JournalStore> WorkflowCtx<'a, S> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::cell::RefCell;
 
     use super::*;
+    use crate::failpoints::CrashOnce;
     use crate::random::RandomBytes;
     use crate::random::RngSource;
     use crate::stores::memory::MemoryJournal;
@@ -531,6 +618,10 @@ mod tests {
 
     fn charge_card() -> StepName {
         StepName::new("charge-card").unwrap()
+    }
+
+    fn create_account() -> StepName {
+        StepName::new("create-account").unwrap()
     }
 
     fn charge_confirmation() -> EventPayload {
@@ -878,22 +969,18 @@ mod tests {
 
         let result = ctx.step(charge_card(), |_key| Ok(charge_confirmation()));
 
-        // Closure ran live and its outcome was freshly journaled to
-        // the store (the pre-existing StepScheduled/StepStarted pair above
-        // only seeds the replay cursor, mirroring the other tests in this
-        // module, and was never written to `store` itself).
+        // The StepScheduled/StepStarted pair above seeds the replay cursor
+        // only; like the other tests here, it is never written to `store`.
+        // The rerun is attempt 2 and does not re-schedule, keeping one
+        // StepScheduled per Seq.
         assert_eq!(result, Ok(charge_confirmation()));
         let journal = store.load(&execution).unwrap();
         assert_eq!(
             journal.events(),
             &[
-                JournalEvent::StepScheduled {
-                    seq: Seq::zero(),
-                    name: charge_card(),
-                },
                 JournalEvent::StepStarted {
                     seq: Seq::zero(),
-                    attempt: Attempt::first(),
+                    attempt: Attempt::first().next(),
                 },
                 JournalEvent::StepCompleted {
                     seq: Seq::zero(),
@@ -904,8 +991,94 @@ mod tests {
     }
 
     #[test]
-    fn replaying_step_scheduled_with_no_further_events_is_nondeterminism() {
-        // Malformed journal, StepScheduled with nothing after it.
+    fn replaying_two_crash_cut_attempts_reruns_the_step_as_the_third_attempt() {
+        // Two crashes in a row, each leaving a StepStarted with no outcome
+        // after it. Replay consumes both and numbers the rerun accordingly.
+        let store = MemoryJournal::new();
+        let execution = signup_execution();
+        let journal = Journal::new(vec![
+            JournalEvent::StepScheduled {
+                seq: Seq::zero(),
+                name: charge_card(),
+            },
+            JournalEvent::StepStarted {
+                seq: Seq::zero(),
+                attempt: Attempt::first(),
+            },
+            JournalEvent::StepStarted {
+                seq: Seq::zero(),
+                attempt: Attempt::first().next(),
+            },
+        ]);
+        let clock = unused_clock();
+        let mut rng = unused_rng();
+        let mut ctx = WorkflowCtx::new(
+            &store,
+            execution,
+            ReplayCursor::new(journal),
+            &clock,
+            &mut rng,
+        );
+
+        let result = ctx.step(charge_card(), |_key| Ok(charge_confirmation()));
+
+        assert_eq!(result, Ok(charge_confirmation()));
+        assert_eq!(
+            store.load(&execution).unwrap().events().first(),
+            Some(&JournalEvent::StepStarted {
+                seq: Seq::zero(),
+                attempt: Attempt::first().next().next(),
+            })
+        );
+    }
+
+    #[test]
+    fn replaying_a_completed_step_after_a_crash_cut_attempt_returns_the_recorded_result() {
+        // A crash-cut attempt followed by a successful one: replay must skip
+        // past both StepStarted events and answer from StepCompleted.
+        let store = MemoryJournal::new();
+        let execution = signup_execution();
+        let journal = Journal::new(vec![
+            JournalEvent::StepScheduled {
+                seq: Seq::zero(),
+                name: charge_card(),
+            },
+            JournalEvent::StepStarted {
+                seq: Seq::zero(),
+                attempt: Attempt::first(),
+            },
+            JournalEvent::StepStarted {
+                seq: Seq::zero(),
+                attempt: Attempt::first().next(),
+            },
+            JournalEvent::StepCompleted {
+                seq: Seq::zero(),
+                result: charge_confirmation(),
+            },
+        ]);
+        let clock = unused_clock();
+        let mut rng = unused_rng();
+        let mut ctx = WorkflowCtx::new(
+            &store,
+            execution,
+            ReplayCursor::new(journal),
+            &clock,
+            &mut rng,
+        );
+
+        let result = ctx.step(charge_card(), |_key| {
+            panic!("replayed step must not run its closure")
+        });
+
+        assert_eq!(result, Ok(charge_confirmation()));
+        assert_eq!(store.load(&execution).unwrap().events(), &[]);
+    }
+
+    #[test]
+    fn replaying_step_scheduled_with_no_further_events_reruns_the_step() {
+        // The process died between StepScheduled and StepStarted
+        // (`CrashPoint::AfterStepScheduled`): no outcome was recorded, so
+        // the step runs live and journals a fresh attempt.
         let store = MemoryJournal::new();
         let execution = signup_execution();
         let journal = Journal::new(vec![JournalEvent::StepScheduled {
@@ -924,13 +1097,13 @@ mod tests {
 
         let result = ctx.step(charge_card(), |_key| Ok(charge_confirmation()));
 
+        assert_eq!(result, Ok(charge_confirmation()));
         assert_eq!(
-            result,
-            Err(StepError::Engine(EngineError::Nondeterminism {
+            store.load(&execution).unwrap().events().last(),
+            Some(&JournalEvent::StepCompleted {
                 seq: Seq::zero(),
-                expected: CommandKind::RunStep,
-                got: CommandKind::RunStep,
-            }))
+                result: charge_confirmation(),
+            })
         );
     }
 
@@ -1517,5 +1690,384 @@ mod tests {
 
         assert!(cursor.is_exhausted());
         assert_eq!(cursor.peek(), None);
+    }
+
+    /// Counts closure executions, which is what the journal cannot be trusted
+    /// to report across a crash.
+    struct EffectCounter {
+        runs: Cell<u32>,
+    }
+
+    impl EffectCounter {
+        fn new() -> Self {
+            Self { runs: Cell::new(0) }
+        }
+
+        fn charge(&self) -> EventPayload {
+            self.runs.set(self.runs.get() + 1);
+            charge_confirmation()
+        }
+
+        fn runs(&self) -> u32 {
+            self.runs.get()
+        }
+    }
+
+    /// Builds a live context whose failpoints crash once at `point`.
+    fn crashing_ctx<'a>(
+        store: &'a MemoryJournal,
+        execution: ExecutionId,
+        clock: &'a TestClock,
+        rng: &'a mut FixedRng,
+        policy: &'a CrashOnce,
+    ) -> WorkflowCtx<'a, MemoryJournal> {
+        WorkflowCtx::with_failpoints(
+            store,
+            execution,
+            ReplayCursor::new(Journal::empty()),
+            clock,
+            rng,
+            policy,
+        )
+    }
+
+    #[test]
+    fn crash_before_step_scheduled_journals_nothing_and_never_runs_the_closure() {
+        let store = MemoryJournal::new();
+        let execution = signup_execution();
+        let clock = unused_clock();
+        let mut rng = unused_rng();
+        let policy = CrashOnce::new(CrashPoint::BeforeStepScheduled(Seq::zero()));
+        let effects = EffectCounter::new();
+        let mut ctx = crashing_ctx(&store, execution, &clock, &mut rng, &policy);
+
+        let result = ctx.step(charge_card(), |_key| Ok(effects.charge()));
+
+        assert_eq!(
+            result,
+            Err(StepError::Engine(EngineError::InjectedCrash(
+                CrashPoint::BeforeStepScheduled(Seq::zero())
+            )))
+        );
+        assert_eq!(effects.runs(), 0);
+        assert_eq!(store.load(&execution).unwrap().events(), &[]);
+    }
+
+    #[test]
+    fn crash_after_step_scheduled_leaves_only_step_scheduled_and_never_runs_the_closure() {
+        let store = MemoryJournal::new();
+        let execution = signup_execution();
+        let clock = unused_clock();
+        let mut rng = unused_rng();
+        let policy = CrashOnce::new(CrashPoint::AfterStepScheduled(Seq::zero()));
+        let effects = EffectCounter::new();
+        let mut ctx = crashing_ctx(&store, execution, &clock, &mut rng, &policy);
+
+        let result = ctx.step(charge_card(), |_key| Ok(effects.charge()));
+
+        assert_eq!(
+            result,
+            Err(StepError::Engine(EngineError::InjectedCrash(
+                CrashPoint::AfterStepScheduled(Seq::zero())
+            )))
+        );
+        assert_eq!(effects.runs(), 0);
+        assert_eq!(
+            store.load(&execution).unwrap().events(),
+            &[JournalEvent::StepScheduled {
+                seq: Seq::zero(),
+                name: charge_card(),
+            }]
+        );
+    }
+
+    #[test]
+    fn crash_after_step_started_leaves_the_step_unfinished_and_never_runs_the_closure() {
+        let store = MemoryJournal::new();
+        let execution = signup_execution();
+        let clock = unused_clock();
+        let mut rng = unused_rng();
+        let policy = CrashOnce::new(CrashPoint::AfterStepStarted(Seq::zero()));
+        let effects = EffectCounter::new();
+        let mut ctx = crashing_ctx(&store, execution, &clock, &mut rng, &policy);
+
+        let result = ctx.step(charge_card(), |_key| Ok(effects.charge()));
+
+        assert_eq!(
+            result,
+            Err(StepError::Engine(EngineError::InjectedCrash(
+                CrashPoint::AfterStepStarted(Seq::zero())
+            )))
+        );
+        assert_eq!(effects.runs(), 0);
+        assert_eq!(
+            store.load(&execution).unwrap().events(),
+            &[
+                JournalEvent::StepScheduled {
+                    seq: Seq::zero(),
+                    name: charge_card(),
+                },
+                JournalEvent::StepStarted {
+                    seq: Seq::zero(),
+                    attempt: Attempt::first(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn crash_after_the_side_effect_runs_the_closure_but_journals_no_step_completed() {
+        // The side effect landed, StepCompleted did not. Recovery cannot
+        // tell, so it reruns the step and the effect happens twice.
+        let store = MemoryJournal::new();
+        let execution = signup_execution();
+        let clock = unused_clock();
+        let mut rng = unused_rng();
+        let policy = CrashOnce::new(CrashPoint::AfterSideEffect(Seq::zero()));
+        let effects = EffectCounter::new();
+        let mut ctx = crashing_ctx(&store, execution, &clock, &mut rng, &policy);
+
+        let result = ctx.step(charge_card(), |_key| Ok(effects.charge()));
+
+        assert_eq!(
+            result,
+            Err(StepError::Engine(EngineError::InjectedCrash(
+                CrashPoint::AfterSideEffect(Seq::zero())
+            )))
+        );
+        assert_eq!(effects.runs(), 1);
+        let journal = store.load(&execution).unwrap();
+        assert_eq!(journal.len(), 2);
+        assert!(matches!(
+            journal.events().last(),
+            Some(JournalEvent::StepStarted { .. })
+        ));
+    }
+
+    #[test]
+    fn crash_after_step_completed_leaves_the_step_fully_journaled() {
+        let store = MemoryJournal::new();
+        let execution = signup_execution();
+        let clock = unused_clock();
+        let mut rng = unused_rng();
+        let policy = CrashOnce::new(CrashPoint::AfterStepCompleted(Seq::zero()));
+        let effects = EffectCounter::new();
+        let mut ctx = crashing_ctx(&store, execution, &clock, &mut rng, &policy);
+
+        let result = ctx.step(charge_card(), |_key| Ok(effects.charge()));
+
+        assert_eq!(
+            result,
+            Err(StepError::Engine(EngineError::InjectedCrash(
+                CrashPoint::AfterStepCompleted(Seq::zero())
+            )))
+        );
+        assert_eq!(effects.runs(), 1);
+        assert_eq!(
+            store.load(&execution).unwrap().events().last(),
+            Some(&JournalEvent::StepCompleted {
+                seq: Seq::zero(),
+                result: charge_confirmation(),
+            })
+        );
+    }
+
+    #[test]
+    fn crash_after_timer_scheduled_leaves_the_timer_armed_and_unfired() {
+        let store = MemoryJournal::new();
+        let execution = signup_execution();
+        let deadline = Deadline::at(charge_renewal_deadline());
+        let clock = unused_clock();
+        let mut rng = unused_rng();
+        let policy = CrashOnce::new(CrashPoint::AfterTimerScheduled(Seq::zero()));
+        let mut ctx = crashing_ctx(&store, execution, &clock, &mut rng, &policy);
+
+        let result = ctx.sleep_until(deadline);
+
+        assert_eq!(
+            result,
+            Err(EngineError::InjectedCrash(CrashPoint::AfterTimerScheduled(
+                Seq::zero()
+            )))
+        );
+        assert_eq!(
+            store.load(&execution).unwrap().events(),
+            &[JournalEvent::TimerScheduled {
+                seq: Seq::zero(),
+                deadline,
+            }]
+        );
+    }
+
+    #[test]
+    fn crash_after_timer_fired_leaves_the_timer_complete() {
+        let store = MemoryJournal::new();
+        let execution = signup_execution();
+        let deadline = Deadline::at(charge_renewal_deadline());
+        let clock = unused_clock();
+        let mut rng = unused_rng();
+        let policy = CrashOnce::new(CrashPoint::AfterTimerFired(Seq::zero()));
+        let mut ctx = crashing_ctx(&store, execution, &clock, &mut rng, &policy);
+
+        let result = ctx.sleep_until(deadline);
+
+        assert_eq!(
+            result,
+            Err(EngineError::InjectedCrash(CrashPoint::AfterTimerFired(
+                Seq::zero()
+            )))
+        );
+        assert_eq!(
+            store.load(&execution).unwrap().events().last(),
+            Some(&JournalEvent::TimerFired { seq: Seq::zero() })
+        );
+    }
+
+    #[test]
+    fn crash_during_a_rearmed_timer_leaves_the_journal_untouched_past_timer_fired() {
+        // Recovery re-arms an already-journaled timer; the failpoint fires
+        // after TimerFired lands, so TimerScheduled is never re-appended.
+        let store = MemoryJournal::new();
+        let execution = signup_execution();
+        let deadline = Deadline::at(charge_renewal_deadline());
+        let journal = Journal::new(vec![JournalEvent::TimerScheduled {
+            seq: Seq::zero(),
+            deadline,
+        }]);
+        let clock = unused_clock();
+        let mut rng = unused_rng();
+        let policy = CrashOnce::new(CrashPoint::AfterTimerFired(Seq::zero()));
+        let mut ctx = WorkflowCtx::with_failpoints(
+            &store,
+            execution,
+            ReplayCursor::new(journal),
+            &clock,
+            &mut rng,
+            &policy,
+        );
+
+        let result = ctx.sleep_until(deadline);
+
+        assert_eq!(
+            result,
+            Err(EngineError::InjectedCrash(CrashPoint::AfterTimerFired(
+                Seq::zero()
+            )))
+        );
+        assert_eq!(
+            store.load(&execution).unwrap().events(),
+            &[JournalEvent::TimerFired { seq: Seq::zero() }]
+        );
+    }
+
+    #[test]
+    fn a_step_after_a_crash_is_refused_without_touching_the_journal() {
+        // A workflow that swallows the crash error and carries on must not
+        // journal anything: the process it models is already dead.
+        let store = MemoryJournal::new();
+        let execution = signup_execution();
+        let clock = unused_clock();
+        let mut rng = unused_rng();
+        let policy = CrashOnce::new(CrashPoint::AfterSideEffect(Seq::zero()));
+        let effects = EffectCounter::new();
+        let mut ctx = crashing_ctx(&store, execution, &clock, &mut rng, &policy);
+        let _crashed = ctx.step(charge_card(), |_key| Ok(effects.charge()));
+        let events_at_crash = store.load(&execution).unwrap().len();
+
+        let result = ctx.step(create_account(), |_key| Ok(effects.charge()));
+
+        assert_eq!(
+            result,
+            Err(StepError::Engine(EngineError::InjectedCrash(
+                CrashPoint::AfterSideEffect(Seq::zero())
+            )))
+        );
+        assert_eq!(effects.runs(), 1);
+        assert_eq!(store.load(&execution).unwrap().len(), events_at_crash);
+    }
+
+    #[test]
+    fn now_after_a_crash_is_refused_without_touching_the_journal() {
+        let store = MemoryJournal::new();
+        let execution = signup_execution();
+        let clock = unused_clock();
+        let mut rng = unused_rng();
+        let policy = CrashOnce::new(CrashPoint::AfterSideEffect(Seq::zero()));
+        let effects = EffectCounter::new();
+        let mut ctx = crashing_ctx(&store, execution, &clock, &mut rng, &policy);
+        let _crashed = ctx.step(charge_card(), |_key| Ok(effects.charge()));
+        let events_at_crash = store.load(&execution).unwrap().len();
+
+        let result = ctx.now();
+
+        assert_eq!(
+            result,
+            Err(EngineError::InjectedCrash(CrashPoint::AfterSideEffect(
+                Seq::zero()
+            )))
+        );
+        assert_eq!(store.load(&execution).unwrap().len(), events_at_crash);
+    }
+
+    #[test]
+    fn random_after_a_crash_is_refused_without_touching_the_journal() {
+        let store = MemoryJournal::new();
+        let execution = signup_execution();
+        let clock = unused_clock();
+        let mut rng = unused_rng();
+        let policy = CrashOnce::new(CrashPoint::AfterSideEffect(Seq::zero()));
+        let effects = EffectCounter::new();
+        let mut ctx = crashing_ctx(&store, execution, &clock, &mut rng, &policy);
+        let _crashed = ctx.step(charge_card(), |_key| Ok(effects.charge()));
+        let events_at_crash = store.load(&execution).unwrap().len();
+
+        let result = ctx.random();
+
+        assert_eq!(
+            result,
+            Err(EngineError::InjectedCrash(CrashPoint::AfterSideEffect(
+                Seq::zero()
+            )))
+        );
+        assert_eq!(store.load(&execution).unwrap().len(), events_at_crash);
+    }
+
+    #[test]
+    fn sleep_until_after_a_crash_is_refused_without_touching_the_journal() {
+        let store = MemoryJournal::new();
+        let execution = signup_execution();
+        let clock = unused_clock();
+        let mut rng = unused_rng();
+        let policy = CrashOnce::new(CrashPoint::AfterSideEffect(Seq::zero()));
+        let effects = EffectCounter::new();
+        let mut ctx = crashing_ctx(&store, execution, &clock, &mut rng, &policy);
+        let _crashed = ctx.step(charge_card(), |_key| Ok(effects.charge()));
+        let events_at_crash = store.load(&execution).unwrap().len();
+
+        let result = ctx.sleep_until(Deadline::at(charge_renewal_deadline()));
+
+        assert_eq!(
+            result,
+            Err(EngineError::InjectedCrash(CrashPoint::AfterSideEffect(
+                Seq::zero()
+            )))
+        );
+        assert_eq!(store.load(&execution).unwrap().len(), events_at_crash);
+    }
+
+    #[test]
+    fn crash_status_is_intact_on_a_run_where_no_failpoint_fires() {
+        let store = MemoryJournal::new();
+        let execution = signup_execution();
+        let clock = unused_clock();
+        let mut rng = unused_rng();
+        let policy = CrashOnce::new(CrashPoint::AfterSideEffect(Seq::zero().next()));
+        let effects = EffectCounter::new();
+        let mut ctx = crashing_ctx(&store, execution, &clock, &mut rng, &policy);
+
+        let result = ctx.step(charge_card(), |_key| Ok(effects.charge()));
+
+        assert_eq!(result, Ok(charge_confirmation()));
+        assert_eq!(ctx.crash_status(), CrashStatus::Intact);
     }
 }
