@@ -13,7 +13,7 @@ use crate::step::Attempt;
 use crate::step::AttemptOverflow;
 
 /// A structurally illegal journal, with the offending event offset.
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum HistoryError {
     /// No invocation was recorded.
     #[error("execution history is empty")]

@@ -99,7 +99,7 @@ impl ReplayCursor {
 }
 
 /// Errors from running or recovering an execution.
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum EngineError {
     #[error(
         "nondeterministic workflow at seq {seq:?}: journal has {expected:?}, code produced {got:?}"
@@ -215,8 +215,24 @@ enum SleepDecision {
     RunLive,
 }
 
+enum ExecutionHealth {
+    Healthy,
+    Faulted(EngineError),
+}
+
 /// The only capability a workflow receives. Every effect goes through here
 /// so replay can intercept it.
+/// The first engine fault refuses later commands without consuming positions
+/// or touching effects or storage. Handled business step failures remain usable.
+///
+/// ```compile_fail
+/// use yaoki::context::WorkflowCtx;
+/// use yaoki::journal::JournalStore;
+///
+/// fn inspect_private_health<S: JournalStore>(ctx: &WorkflowCtx<'_, S>) {
+///     let _ = &ctx.health;
+/// }
+/// ```
 pub struct WorkflowCtx<'a, S: JournalStore> {
     store: &'a S,
     execution: ExecutionId,
@@ -225,7 +241,7 @@ pub struct WorkflowCtx<'a, S: JournalStore> {
     clock: &'a dyn Clock,
     rng: &'a mut dyn RngSource,
     failpoints: &'a dyn FailpointPolicy,
-    crash: CrashStatus,
+    health: ExecutionHealth,
 }
 
 impl<'a, S: JournalStore> WorkflowCtx<'a, S> {
@@ -266,13 +282,31 @@ impl<'a, S: JournalStore> WorkflowCtx<'a, S> {
             clock,
             rng,
             failpoints,
-            crash: CrashStatus::Intact,
+            health: ExecutionHealth::Healthy,
         }
     }
 
     /// Whether an injected crash fired during this run.
     pub fn crash_status(&self) -> CrashStatus {
-        self.crash
+        match &self.health {
+            ExecutionHealth::Faulted(EngineError::InjectedCrash(point)) => {
+                CrashStatus::Crashed(*point)
+            }
+            ExecutionHealth::Healthy
+            | ExecutionHealth::Faulted(
+                EngineError::Nondeterminism { .. }
+                | EngineError::UnconsumedHistory
+                | EngineError::VersionMismatch { .. }
+                | EngineError::WorkflowMismatch { .. }
+                | EngineError::MissingExecution { .. }
+                | EngineError::ExistingExecution { .. }
+                | EngineError::InvalidInvocation { .. }
+                | EngineError::Sequence(_)
+                | EngineError::Attempt(_)
+                | EngineError::History(_)
+                | EngineError::Journal(_),
+            ) => CrashStatus::Intact,
+        }
     }
 
     /// Refuses terminal recording while replay still has unread events.
@@ -289,27 +323,49 @@ impl<'a, S: JournalStore> WorkflowCtx<'a, S> {
         }
     }
 
-    /// Consults the policy at `point`. On `Crash`, records the crash and
-    /// returns the error without journaling anything: the journal is left
-    /// exactly as a process death at this window would leave it.
+    /// Leaves the journal at the selected process-death window.
+    /// The enclosing command retains the crash before returning to workflow code.
     fn checkpoint(&mut self, point: CrashPoint) -> Result<(), EngineError> {
         match self.failpoints.at(point) {
             FailpointDecision::Continue => Ok(()),
-            FailpointDecision::Crash => {
-                self.crash = CrashStatus::Crashed(point);
-                Err(EngineError::InjectedCrash(point))
-            }
+            FailpointDecision::Crash => Err(EngineError::InjectedCrash(point)),
         }
     }
 
-    /// A crashed process runs no further commands. Once a failpoint has
-    /// fired, every later `ctx` call fails with the same crash without
-    /// consuming a `Seq` or touching the journal, so a workflow that swallows
-    /// the first error cannot journal past its own death.
-    fn refuse_after_crash(&self) -> Result<(), EngineError> {
-        match self.crash {
-            CrashStatus::Intact => Ok(()),
-            CrashStatus::Crashed(point) => Err(EngineError::InjectedCrash(point)),
+    /// Returns the first engine fault before further commands or finalization.
+    pub(crate) fn ensure_healthy(&self) -> Result<(), EngineError> {
+        match &self.health {
+            ExecutionHealth::Healthy => Ok(()),
+            ExecutionHealth::Faulted(error) => Err(error.clone()),
+        }
+    }
+
+    fn retain_engine_result<T>(
+        &mut self,
+        result: Result<T, EngineError>,
+    ) -> Result<T, EngineError> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => match &self.health {
+                ExecutionHealth::Healthy => {
+                    self.health = ExecutionHealth::Faulted(error.clone());
+                    Err(error)
+                }
+                ExecutionHealth::Faulted(first) => Err(first.clone()),
+            },
+        }
+    }
+
+    fn retain_step_result(
+        &mut self,
+        result: Result<EventPayload, StepError>,
+    ) -> Result<EventPayload, StepError> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(StepError::Failed(error)) => Err(StepError::Failed(error)),
+            Err(StepError::Engine(error)) => self
+                .retain_engine_result(Err(error))
+                .map_err(StepError::Engine),
         }
     }
 
@@ -319,7 +375,12 @@ impl<'a, S: JournalStore> WorkflowCtx<'a, S> {
     /// `Nondeterminism` if the journal expected a different command at this
     /// position. `Journal` if the store cannot be reached.
     pub fn now(&mut self) -> Result<Timestamp, EngineError> {
-        self.refuse_after_crash()?;
+        self.ensure_healthy()?;
+        let result = self.resolve_now();
+        self.retain_engine_result(result)
+    }
+
+    fn resolve_now(&mut self) -> Result<Timestamp, EngineError> {
         let seq = self.seq;
         self.seq = self.seq.next().map_err(EngineError::from)?;
 
@@ -361,7 +422,12 @@ impl<'a, S: JournalStore> WorkflowCtx<'a, S> {
     /// `Nondeterminism` if the journal expected a different command at this
     /// position. `Journal` if the store cannot be reached.
     pub fn random(&mut self) -> Result<RandomBytes, EngineError> {
-        self.refuse_after_crash()?;
+        self.ensure_healthy()?;
+        let result = self.resolve_random();
+        self.retain_engine_result(result)
+    }
+
+    fn resolve_random(&mut self) -> Result<RandomBytes, EngineError> {
         let seq = self.seq;
         self.seq = self.seq.next().map_err(EngineError::from)?;
 
@@ -404,7 +470,12 @@ impl<'a, S: JournalStore> WorkflowCtx<'a, S> {
     /// `Nondeterminism` if the journal expected a different command at this
     /// position. `Journal` if the store cannot be reached.
     pub fn sleep_until(&mut self, deadline: Deadline) -> Result<(), EngineError> {
-        self.refuse_after_crash()?;
+        self.ensure_healthy()?;
+        let result = self.resolve_sleep(deadline);
+        self.retain_engine_result(result)
+    }
+
+    fn resolve_sleep(&mut self, deadline: Deadline) -> Result<(), EngineError> {
         let seq = self.seq;
         self.seq = self.seq.next().map_err(EngineError::from)?;
 
@@ -480,7 +551,15 @@ impl<'a, S: JournalStore> WorkflowCtx<'a, S> {
     where
         F: FnOnce(IdempotencyKey) -> Result<EventPayload, StepErrorRecord>,
     {
-        self.refuse_after_crash().map_err(StepError::Engine)?;
+        self.ensure_healthy().map_err(StepError::Engine)?;
+        let result = self.resolve_step(name, f);
+        self.retain_step_result(result)
+    }
+
+    fn resolve_step<F>(&mut self, name: StepName, f: F) -> Result<EventPayload, StepError>
+    where
+        F: FnOnce(IdempotencyKey) -> Result<EventPayload, StepErrorRecord>,
+    {
         let seq = self.seq;
         self.seq = self.seq.next().map_err(EngineError::from)?;
 
@@ -627,11 +706,35 @@ mod tests {
     use std::cell::Cell;
     use std::cell::RefCell;
 
-    use super::*;
+    use super::EngineError;
+    use super::Mode;
+    use super::ReplayCursor;
+    use super::WorkflowCtx;
+    use crate::command::CommandKind;
+    use crate::execution::ExecutionId;
+    use crate::execution::WorkflowName;
+    use crate::execution::WorkflowVersion;
     use crate::failpoints::CrashOnce;
+    use crate::failpoints::CrashPoint;
+    use crate::failpoints::CrashStatus;
+    use crate::history::HistoryError;
+    use crate::journal::EventOffset;
+    use crate::journal::EventPayload;
+    use crate::journal::Journal;
+    use crate::journal::JournalError;
+    use crate::journal::JournalEvent;
+    use crate::journal::JournalStore;
+    use crate::journal::Seq;
+    use crate::journal::SeqError;
     use crate::random::RandomBytes;
     use crate::random::RngSource;
+    use crate::step::Attempt;
+    use crate::step::AttemptOverflow;
+    use crate::step::StepError;
+    use crate::step::StepErrorRecord;
+    use crate::step::StepName;
     use crate::stores::memory::MemoryJournal;
+    use crate::time::Clock;
     use crate::time::Deadline;
     use crate::time::TestClock;
     use crate::time::Timestamp;
@@ -737,6 +840,129 @@ mod tests {
 
         fn load(&self, _id: &ExecutionId) -> Result<Journal, JournalError> {
             Err(JournalError::Poisoned)
+        }
+    }
+
+    #[test]
+    fn retaining_another_error_preserves_the_first_fault() {
+        let store = MemoryJournal::new();
+        let clock = unused_clock();
+        let mut rng = unused_rng();
+        let mut ctx = WorkflowCtx::new(
+            &store,
+            signup_execution(),
+            ReplayCursor::new(Journal::empty()),
+            &clock,
+            &mut rng,
+        );
+        let first = EngineError::Sequence(SeqError::Overflow);
+
+        assert_eq!(
+            ctx.retain_engine_result::<()>(Err(first.clone())),
+            Err(first.clone())
+        );
+        let second =
+            ctx.retain_engine_result::<()>(Err(EngineError::Journal(JournalError::Poisoned)));
+
+        assert_eq!(second, Err(first.clone()));
+        assert_eq!(ctx.ensure_healthy(), Err(first));
+        assert_eq!(ctx.crash_status(), CrashStatus::Intact);
+    }
+
+    #[test]
+    fn refused_commands_preserve_the_position_and_unread_cursor_after_divergence() {
+        let store = MemoryJournal::new();
+        let execution = signup_execution();
+        let mut rng = ForbiddenEffects;
+        let mut ctx = WorkflowCtx::new(
+            &store,
+            execution,
+            ReplayCursor::new(Journal::new(vec![JournalEvent::NowRecorded {
+                seq: Seq::zero(),
+                value: charge_renewal_deadline(),
+            }])),
+            &ForbiddenEffects,
+            &mut rng,
+        );
+        let first = ctx.random().unwrap_err();
+        let position = ctx.seq;
+
+        assert_eq!(ctx.now(), Err(first.clone()));
+        assert_eq!(ctx.random(), Err(first.clone()));
+        assert_eq!(
+            ctx.sleep_until(Deadline::at(charge_renewal_deadline())),
+            Err(first.clone())
+        );
+        assert_eq!(
+            ctx.step(charge_card(), |_key| panic!(
+                "a rejected run cannot execute a body"
+            )),
+            Err(StepError::Engine(first))
+        );
+
+        assert_eq!(ctx.seq, position);
+        match &ctx.mode {
+            Mode::Replaying(cursor) => assert_eq!(cursor.position.get(), 0),
+            Mode::Live => panic!("a rejected replay cannot become live"),
+        }
+        assert!(store.load(&execution).unwrap().is_empty());
+    }
+
+    #[test]
+    fn crash_status_projects_every_fault_kind_without_losing_the_original_error() {
+        let id = signup_execution();
+        let point = CrashPoint::BeforeStepScheduled(Seq::zero());
+        let faults = [
+            EngineError::Nondeterminism {
+                seq: Seq::zero(),
+                expected: CommandKind::ReadNow,
+                got: CommandKind::RunStep,
+            },
+            EngineError::UnconsumedHistory,
+            EngineError::VersionMismatch {
+                recorded: WorkflowVersion::new("2026.08.01").unwrap(),
+                current: WorkflowVersion::new("2026.08.02").unwrap(),
+            },
+            EngineError::WorkflowMismatch {
+                recorded: WorkflowName::new("signup").unwrap(),
+                current: WorkflowName::new("subscription-renewal").unwrap(),
+            },
+            EngineError::MissingExecution { id },
+            EngineError::ExistingExecution { id },
+            EngineError::InvalidInvocation { id },
+            EngineError::Sequence(SeqError::Overflow),
+            EngineError::Attempt(AttemptOverflow),
+            EngineError::History(HistoryError::UnexpectedEvent {
+                offset: EventOffset::from_index(0),
+            }),
+            EngineError::Journal(JournalError::Poisoned),
+        ];
+        let cases = faults
+            .into_iter()
+            .map(|fault| (fault, CrashStatus::Intact))
+            .chain([(
+                EngineError::InjectedCrash(point),
+                CrashStatus::Crashed(point),
+            )]);
+        for (fault, expected_status) in cases {
+            let store = MemoryJournal::new();
+            let clock = unused_clock();
+            let mut rng = unused_rng();
+            let mut ctx = WorkflowCtx::new(
+                &store,
+                id,
+                ReplayCursor::new(Journal::empty()),
+                &clock,
+                &mut rng,
+            );
+
+            assert_eq!(
+                ctx.retain_engine_result::<()>(Err(fault.clone())),
+                Err(fault.clone())
+            );
+
+            assert_eq!(ctx.ensure_healthy(), Err(fault));
+            assert_eq!(ctx.crash_status(), expected_status);
         }
     }
 

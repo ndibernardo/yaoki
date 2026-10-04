@@ -22,7 +22,7 @@ use crate::time::Timestamp;
 pub struct Seq(u64);
 
 /// A command position has no representable successor.
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum SeqError {
     /// The current position is `u64::MAX`.
     #[error("command position overflow")]
@@ -198,7 +198,7 @@ impl Journal {
 }
 
 /// Failures a `JournalStore` can report.
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum JournalError {
     /// Another cooperating execution handle currently owns this stream.
     #[error("execution {id:?} is already owned")]
@@ -238,6 +238,10 @@ pub trait JournalStore {
 
     /// Appends `event` to the execution's log. Returns the 0-based position
     /// the event was appended at.
+    ///
+    /// # Errors
+    /// An error does not prove that the event is absent. Stop the current execution
+    /// attempt and reload under ownership before resuming; do not assume rollback.
     fn append(&self, id: &ExecutionId, event: JournalEvent) -> Result<EventOffset, JournalError>;
 
     /// Loads the full event history for `id`. An execution with no events

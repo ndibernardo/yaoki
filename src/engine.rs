@@ -12,7 +12,6 @@ use crate::execution::ExecutionId;
 use crate::execution::WorkflowErrorRecord;
 use crate::execution::WorkflowName;
 use crate::execution::WorkflowVersion;
-use crate::failpoints::CrashStatus;
 use crate::failpoints::FailpointPolicy;
 use crate::failpoints::NeverCrash;
 use crate::history::RecoveryHistory;
@@ -393,8 +392,9 @@ impl<'a, S: JournalStore> Engine<'a, S> {
     /// returns its recorded outcome without invoking `workflow.run` again.
     /// Input is always taken from the validated durable start record. The complete
     /// event grammar is checked before workflow code or terminal retrieval.
-    /// Workflow success and failure require consuming all recorded events;
-    /// otherwise recovery returns `EngineError::UnconsumedHistory` without
+    /// A context engine fault prevents finalization even if workflow code
+    /// catches it. Otherwise success and failure require consuming all recorded
+    /// events; unread history returns `EngineError::UnconsumedHistory` without
     /// appending a terminal event.
     ///
     /// ```compile_fail
@@ -447,15 +447,9 @@ impl<'a, S: JournalStore> Engine<'a, S> {
     ) -> Result<EventPayload, RunError<W::Error>> {
         let result = workflow.run(ctx, input);
 
-        // A fired failpoint stands for process death: nothing terminal may be
-        // journaled, whatever the workflow returned. A workflow that
-        // swallowed the crash error does not get to complete.
-        match ctx.crash_status() {
-            CrashStatus::Crashed(point) => {
-                return Err(RunError::Engine(EngineError::InjectedCrash(point)));
-            }
-            CrashStatus::Intact => {}
-        }
+        // Workflow errors need not preserve a caught or wrapped engine fault.
+        // Retained health takes precedence over terminal outcomes.
+        ctx.ensure_healthy().map_err(RunError::Engine)?;
         ctx.ensure_replay_complete().map_err(RunError::Engine)?;
 
         match result {

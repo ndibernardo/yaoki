@@ -52,7 +52,7 @@ pub enum AttemptError {
 }
 
 /// A retry attempt has no representable successor.
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
 #[error("attempt counter overflow")]
 pub struct AttemptOverflow;
 

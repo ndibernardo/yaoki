@@ -12,6 +12,7 @@
 //! even when the live clock on recovery reads a different, post-deadline
 //! instant.
 
+use yaoki::command::CommandKind;
 use yaoki::context::EngineError;
 use yaoki::context::WorkflowCtx;
 use yaoki::engine::Engine;
@@ -234,7 +235,7 @@ impl Workflow<MemoryJournal> for TimeAwareRenewalWorkflow {
 }
 
 #[test]
-fn recovery_branching_on_ambient_time_with_a_different_step_name_rejects_unconsumed_history() {
+fn recovery_branching_on_ambient_time_with_a_different_step_name_returns_the_first_fault() {
     let store = MemoryJournal::new();
     let execution = renewal_execution();
     seed_crashed_run_after_charge_renewal(&store, execution);
@@ -251,13 +252,17 @@ fn recovery_branching_on_ambient_time_with_a_different_step_name_rejects_unconsu
 
     assert!(matches!(
         result,
-        Err(RunError::Engine(EngineError::UnconsumedHistory))
+        Err(RunError::Engine(EngineError::Nondeterminism {
+            seq,
+            expected: CommandKind::RunStep,
+            got: CommandKind::RunStep,
+        })) if seq == Seq::zero()
     ));
     assert_eq!(store.load(&execution).unwrap(), before);
 }
 
 #[test]
-fn recovery_branching_on_ambient_time_reading_now_instead_of_a_step_rejects_unconsumed_history() {
+fn recovery_branching_on_ambient_time_reading_now_instead_of_a_step_returns_the_first_fault() {
     let store = MemoryJournal::new();
     let execution = renewal_execution();
     seed_crashed_run_after_charge_renewal(&store, execution);
@@ -274,7 +279,11 @@ fn recovery_branching_on_ambient_time_reading_now_instead_of_a_step_rejects_unco
 
     assert!(matches!(
         result,
-        Err(RunError::Engine(EngineError::UnconsumedHistory))
+        Err(RunError::Engine(EngineError::Nondeterminism {
+            seq,
+            expected: CommandKind::RunStep,
+            got: CommandKind::ReadNow,
+        })) if seq == Seq::zero()
     ));
     assert_eq!(store.load(&execution).unwrap(), before);
 }
