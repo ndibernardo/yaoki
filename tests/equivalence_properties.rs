@@ -276,7 +276,6 @@ fn crash_then_recover<S: JournalStore>(
                 steps: steps.to_vec(),
                 effects: &effects,
             },
-            onboarding_input(),
             &onboarding_clock(),
             &mut unused_rng(),
         )
@@ -516,7 +515,6 @@ proptest! {
                             steps: steps.clone(),
                             effects: &replay_effects,
                         },
-                        onboarding_input(),
                         &onboarding_clock(),
                         &mut unused_rng(),
                     )

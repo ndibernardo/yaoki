@@ -13,7 +13,9 @@
 //! itself stays serde-free.
 
 use std::fs;
+use std::fs::File;
 use std::fs::OpenOptions;
+use std::fs::TryLockError;
 use std::io;
 use std::io::Write;
 use std::path::Path;
@@ -301,11 +303,36 @@ fn io_error(source: io::Error) -> JournalError {
     }
 }
 
+fn ownership_error(id: ExecutionId, error: TryLockError) -> JournalError {
+    match error {
+        TryLockError::WouldBlock => JournalError::ExecutionOwned { id },
+        TryLockError::Error(error) => io_error(error),
+    }
+}
+
 /// One append-only file per execution: `<dir>/<execution-id-hex>.journal`.
 /// Appends sync the journal file, not the external effects of a step body.
 /// An effect can complete before its result is journaled and repeat on recovery.
 pub struct FileJournal {
     dir: PathBuf,
+}
+
+/// A cooperating owner's OS lock, explicitly unlocked on drop.
+/// Lock files remain in place so later owners lock the same inode. Do not delete
+/// or replace them while the journal directory is in use. Local filesystems on
+/// Linux and macOS are the supported scope; unsupported locks return I/O errors.
+/// This does not fence non-cooperating writers or establish power-loss durability.
+pub struct FileLease {
+    lock: File,
+}
+
+impl Drop for FileLease {
+    fn drop(&mut self) {
+        // Closing alone can retain ownership in a descriptor inherited during
+        // concurrent process creation. Drop cannot report an unlock error;
+        // closing the owned handle remains the fallback if unlocking fails.
+        let _ = self.lock.unlock();
+    }
 }
 
 impl FileJournal {
@@ -354,6 +381,22 @@ impl FileJournal {
 }
 
 impl JournalStore for FileJournal {
+    type Lease<'a> = FileLease;
+
+    fn acquire(&self, id: &ExecutionId) -> Result<FileLease, JournalError> {
+        let path = self.dir.join(format!("{}.lock", hex_encode(id.as_bytes())));
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .map_err(io_error)?;
+        lock.try_lock()
+            .map_err(|error| ownership_error(*id, error))?;
+        Ok(FileLease { lock })
+    }
+
     fn append(&self, id: &ExecutionId, event: JournalEvent) -> Result<Seq, JournalError> {
         let path = self.path_for(id);
         let existing = Self::read_and_heal(&path)?;
@@ -383,8 +426,33 @@ impl JournalStore for FileJournal {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::fs;
+    use std::fs::OpenOptions;
+    use std::fs::TryLockError;
+    use std::io;
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    use super::FileJournal;
+    use super::JournalEventRecord;
+    use super::crc32;
+    use super::ownership_error;
+    use crate::execution::ExecutionId;
+    use crate::execution::WorkflowErrorRecord;
+    use crate::execution::WorkflowName;
+    use crate::execution::WorkflowVersion;
+    use crate::journal::EventPayload;
+    use crate::journal::JournalError;
+    use crate::journal::JournalEvent;
+    use crate::journal::JournalStore;
+    use crate::journal::Seq;
+    use crate::random::RandomBytes;
     use crate::random::RngSource;
+    use crate::step::Attempt;
+    use crate::step::StepErrorRecord;
+    use crate::step::StepName;
+    use crate::time::Deadline;
+    use crate::time::Timestamp;
 
     struct FixedRng {
         bytes: [u8; 32],
@@ -430,6 +498,52 @@ mod tests {
             seq,
             result: EventPayload::new(br#"{"charge_id":"ch_2026_0718"}"#.to_vec()),
         }
+    }
+
+    #[test]
+    fn dropping_a_lease_releases_ownership_even_while_an_inherited_descriptor_remains_open() {
+        let dir = temp_dir("inherited-lock-descriptor");
+        let store = FileJournal::new(&dir).unwrap();
+        let lease = store.acquire(&signup_execution()).unwrap();
+        // A clone shares the open file description just as a descriptor
+        // inherited during another thread's process spawn does.
+        let inherited = lease.lock.try_clone().unwrap();
+
+        drop(lease);
+
+        assert!(store.acquire(&signup_execution()).is_ok());
+        drop(inherited);
+    }
+
+    #[test]
+    fn ownership_error_distinguishes_contention_from_locking_io_failure() {
+        let id = signup_execution();
+        assert_eq!(
+            ownership_error(id, TryLockError::WouldBlock),
+            JournalError::ExecutionOwned { id }
+        );
+        assert_eq!(
+            ownership_error(
+                id,
+                TryLockError::Error(io::Error::other("filesystem locking failed"))
+            ),
+            JournalError::Io {
+                message: "filesystem locking failed".to_owned()
+            },
+        );
+    }
+
+    #[test]
+    fn acquire_reports_an_io_error_when_the_lock_file_cannot_be_opened() {
+        let dir = temp_dir("ownership-open-failure");
+        let store = FileJournal::new(&dir).unwrap();
+        fs::remove_dir(&dir).unwrap();
+
+        assert!(matches!(
+            store.acquire(&signup_execution()),
+            Err(JournalError::Io { .. })
+        ));
+        assert!(!dir.exists());
     }
 
     #[test]

@@ -22,7 +22,7 @@ use crate::journal::JournalStore;
 use crate::random::RngSource;
 use crate::time::Clock;
 
-/// Journal empty: no `ExecutionStarted` yet.
+/// A handle that has not appended `ExecutionStarted`.
 pub struct Created;
 /// `ExecutionStarted` appended; workflow run in progress.
 pub struct Running;
@@ -31,12 +31,120 @@ pub struct Completed;
 /// Terminal: `ExecutionFailed` appended.
 pub struct Failed;
 
+/// One validated durable invocation. Fields cannot be constructed independently.
+///
+/// ```compile_fail
+/// use yaoki::engine::Invocation;
+/// use yaoki::journal::EventPayload;
+///
+/// fn replace_input(invocation: &mut Invocation) {
+///     invocation.input = EventPayload::new(Vec::new());
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Invocation {
+    id: ExecutionId,
+    workflow: WorkflowName,
+    version: WorkflowVersion,
+    input: EventPayload,
+}
+
+impl Invocation {
+    /// The execution whose start record supplied this invocation.
+    pub fn id(&self) -> ExecutionId {
+        self.id
+    }
+
+    /// The recorded workflow name.
+    pub fn workflow(&self) -> &WorkflowName {
+        &self.workflow
+    }
+
+    /// The recorded workflow version.
+    pub fn version(&self) -> &WorkflowVersion {
+        &self.version
+    }
+
+    /// The authoritative input bytes from the start record.
+    pub fn input(&self) -> &EventPayload {
+        &self.input
+    }
+
+    fn parse(id: ExecutionId, journal: &Journal) -> Result<Self, EngineError> {
+        let invocation = match journal.events().first() {
+            None => return Err(EngineError::MissingExecution { id }),
+            Some(JournalEvent::ExecutionStarted {
+                workflow,
+                version,
+                input,
+            }) => Self {
+                id,
+                workflow: workflow.clone(),
+                version: version.clone(),
+                input: input.clone(),
+            },
+            Some(
+                JournalEvent::StepScheduled { .. }
+                | JournalEvent::StepStarted { .. }
+                | JournalEvent::StepCompleted { .. }
+                | JournalEvent::StepFailed { .. }
+                | JournalEvent::NowRecorded { .. }
+                | JournalEvent::RandomRecorded { .. }
+                | JournalEvent::TimerScheduled { .. }
+                | JournalEvent::TimerFired { .. }
+                | JournalEvent::ExecutionCompleted { .. }
+                | JournalEvent::ExecutionFailed { .. },
+            ) => {
+                return Err(EngineError::InvalidInvocation { id });
+            }
+        };
+        if journal.events().iter().skip(1).any(is_execution_start) {
+            return Err(EngineError::InvalidInvocation { id });
+        }
+        Ok(invocation)
+    }
+
+    fn select(&self, name: &WorkflowName, version: &WorkflowVersion) -> Result<(), EngineError> {
+        if &self.workflow != name {
+            return Err(EngineError::WorkflowMismatch {
+                recorded: self.workflow.clone(),
+                current: name.clone(),
+            });
+        }
+        if &self.version != version {
+            return Err(EngineError::VersionMismatch {
+                recorded: self.version.clone(),
+                current: version.clone(),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn is_execution_start(event: &JournalEvent) -> bool {
+    match event {
+        JournalEvent::ExecutionStarted { .. } => true,
+        JournalEvent::StepScheduled { .. }
+        | JournalEvent::StepStarted { .. }
+        | JournalEvent::StepCompleted { .. }
+        | JournalEvent::StepFailed { .. }
+        | JournalEvent::NowRecorded { .. }
+        | JournalEvent::RandomRecorded { .. }
+        | JournalEvent::TimerScheduled { .. }
+        | JournalEvent::TimerFired { .. }
+        | JournalEvent::ExecutionCompleted { .. }
+        | JournalEvent::ExecutionFailed { .. } => false,
+    }
+}
+
 /// An execution's identity, tagged with its lifecycle state at the type
 /// level. Illegal transitions (completing a `Created` execution, resuming a
-/// `Completed` one) do not compile.
+/// `Completed` one) do not compile. The handle owns the stream until dropped,
+/// including while a terminal handle is retained.
 pub struct Execution<'a, S: JournalStore, State> {
     store: &'a S,
     id: ExecutionId,
+    lease: S::Lease<'a>,
     _state: PhantomData<State>,
 }
 
@@ -47,12 +155,19 @@ impl<'a, S: JournalStore, State> Execution<'a, S, State> {
 }
 
 impl<'a, S: JournalStore> Execution<'a, S, Created> {
-    pub fn new(store: &'a S, id: ExecutionId) -> Self {
-        Self {
+    /// Acquires ownership without assuming that the execution is absent.
+    /// The subsequent start checks absence while the same lease is held.
+    ///
+    /// # Errors
+    /// Returns a journal ownership conflict or acquisition I/O failure.
+    pub fn new(store: &'a S, id: ExecutionId) -> Result<Self, EngineError> {
+        let lease = store.acquire(&id)?;
+        Ok(Self {
             store,
             id,
+            lease,
             _state: PhantomData,
-        }
+        })
     }
 
     /// Appends `ExecutionStarted`, transitions to `Running`. Consumes self.
@@ -62,6 +177,9 @@ impl<'a, S: JournalStore> Execution<'a, S, Created> {
         version: WorkflowVersion,
         input: EventPayload,
     ) -> Result<Execution<'a, S, Running>, EngineError> {
+        if !self.store.load(&self.id)?.is_empty() {
+            return Err(EngineError::ExistingExecution { id: self.id });
+        }
         self.store
             .append(
                 &self.id,
@@ -75,37 +193,32 @@ impl<'a, S: JournalStore> Execution<'a, S, Created> {
         Ok(Execution {
             store: self.store,
             id: self.id,
+            lease: self.lease,
             _state: PhantomData,
         })
     }
 
-    /// Inspects the journal tail and re-enters the correct state.
+    /// Validates the recorded invocation before inspecting its terminal outcome.
     ///
     /// # Errors
-    /// `VersionMismatch` if the journal's recorded workflow version differs
-    /// from `current_version`. `Journal` if the store cannot be reached.
+    /// Reports absent or invalid invocations, mismatched names or versions,
+    /// and storage failures before returning an execution.
     pub fn recover(
         store: &'a S,
         id: ExecutionId,
+        current_name: &WorkflowName,
         current_version: &WorkflowVersion,
     ) -> Result<RecoveredExecution<'a, S>, EngineError> {
+        let lease = store.acquire(&id)?;
         let journal = store.load(&id).map_err(EngineError::from)?;
-
-        if let Some(JournalEvent::ExecutionStarted {
-            version: recorded, ..
-        }) = journal.events().first()
-            && recorded != current_version
-        {
-            return Err(EngineError::VersionMismatch {
-                recorded: recorded.clone(),
-                current: current_version.clone(),
-            });
-        }
+        let invocation = Invocation::parse(id, &journal)?;
+        invocation.select(current_name, current_version)?;
 
         if let Some(JournalEvent::ExecutionCompleted { output }) = journal.events().last() {
             let execution = Execution {
                 store,
                 id,
+                lease,
                 _state: PhantomData,
             };
             return Ok(RecoveredExecution::AlreadyCompleted(
@@ -117,6 +230,7 @@ impl<'a, S: JournalStore> Execution<'a, S, Created> {
             let execution = Execution {
                 store,
                 id,
+                lease,
                 _state: PhantomData,
             };
             return Ok(RecoveredExecution::AlreadyFailed(execution, error.clone()));
@@ -129,9 +243,12 @@ impl<'a, S: JournalStore> Execution<'a, S, Created> {
         let execution = Execution {
             store,
             id,
+            lease,
             _state: PhantomData,
         };
-        Ok(RecoveredExecution::StillRunning(execution, cursor))
+        Ok(RecoveredExecution::StillRunning(
+            execution, cursor, invocation,
+        ))
     }
 }
 
@@ -148,6 +265,7 @@ impl<'a, S: JournalStore> Execution<'a, S, Running> {
         Ok(Execution {
             store: self.store,
             id: self.id,
+            lease: self.lease,
             _state: PhantomData,
         })
     }
@@ -161,6 +279,7 @@ impl<'a, S: JournalStore> Execution<'a, S, Running> {
         Ok(Execution {
             store: self.store,
             id: self.id,
+            lease: self.lease,
             _state: PhantomData,
         })
     }
@@ -168,7 +287,7 @@ impl<'a, S: JournalStore> Execution<'a, S, Running> {
 
 /// Where `Execution::recover` found an execution, from the journal tail.
 pub enum RecoveredExecution<'a, S: JournalStore> {
-    StillRunning(Execution<'a, S, Running>, ReplayCursor),
+    StillRunning(Execution<'a, S, Running>, ReplayCursor, Invocation),
     AlreadyCompleted(Execution<'a, S, Completed>, EventPayload),
     AlreadyFailed(Execution<'a, S, Failed>, WorkflowErrorRecord),
 }
@@ -257,6 +376,7 @@ impl<'a, S: JournalStore> Engine<'a, S> {
         rng: &mut dyn RngSource,
     ) -> Result<EventPayload, RunError<W::Error>> {
         let execution = Execution::new(self.store, id)
+            .map_err(RunError::Engine)?
             .start(workflow.name(), workflow.version(), input.clone())
             .map_err(RunError::Engine)?;
         let mut ctx = WorkflowCtx::with_failpoints(
@@ -273,18 +393,37 @@ impl<'a, S: JournalStore> Engine<'a, S> {
     /// Recovers `id` and continues it: replays journaled commands, then
     /// runs any unjournaled remainder live. An execution already terminal
     /// returns its recorded outcome without invoking `workflow.run` again.
+    /// Input is always taken from the validated durable start record.
+    ///
+    /// ```compile_fail
+    /// use yaoki::engine::Engine;
+    /// use yaoki::engine::Workflow;
+    /// use yaoki::execution::ExecutionId;
+    /// use yaoki::journal::EventPayload;
+    /// use yaoki::journal::JournalStore;
+    /// use yaoki::random::RngSource;
+    /// use yaoki::time::Clock;
+    ///
+    /// fn replay<S: JournalStore, W: Workflow<S>>(
+    ///     engine: &Engine<'_, S>, id: ExecutionId, workflow: &W,
+    ///     input: EventPayload, clock: &dyn Clock, rng: &mut dyn RngSource,
+    /// ) {
+    ///     let _ = engine.recover_and_run(id, workflow, input, clock, rng);
+    /// }
+    /// ```
     pub fn recover_and_run<W: Workflow<S>>(
         &self,
         id: ExecutionId,
         workflow: &W,
-        input: EventPayload,
         clock: &dyn Clock,
         rng: &mut dyn RngSource,
     ) -> Result<EventPayload, RunError<W::Error>> {
-        match Execution::recover(self.store, id, &workflow.version()).map_err(RunError::Engine)? {
+        match Execution::recover(self.store, id, &workflow.name(), &workflow.version())
+            .map_err(RunError::Engine)?
+        {
             RecoveredExecution::AlreadyCompleted(_, output) => Ok(output),
             RecoveredExecution::AlreadyFailed(_, error) => Err(RunError::Recovered(error)),
-            RecoveredExecution::StillRunning(execution, cursor) => {
+            RecoveredExecution::StillRunning(execution, cursor, invocation) => {
                 let mut ctx = WorkflowCtx::with_failpoints(
                     self.store,
                     id,
@@ -293,7 +432,7 @@ impl<'a, S: JournalStore> Engine<'a, S> {
                     rng,
                     self.failpoints,
                 );
-                Self::finish(execution, &mut ctx, workflow, input)
+                Self::finish(execution, &mut ctx, workflow, invocation.input)
             }
         }
     }
@@ -334,7 +473,20 @@ impl<'a, S: JournalStore> Engine<'a, S> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::Engine;
+    use super::Execution;
+    use super::RecoveredExecution;
+    use super::RunError;
+    use super::Workflow;
+    use crate::context::EngineError;
+    use crate::context::WorkflowCtx;
+    use crate::execution::ExecutionId;
+    use crate::execution::WorkflowErrorRecord;
+    use crate::execution::WorkflowName;
+    use crate::execution::WorkflowVersion;
+    use crate::journal::EventPayload;
+    use crate::journal::JournalEvent;
+    use crate::journal::JournalStore;
     use crate::random::RandomBytes;
     use crate::random::RngSource;
     use crate::step::StepErrorRecord;
@@ -459,6 +611,7 @@ mod tests {
         let execution = signup_execution();
 
         let running = Execution::new(&store, execution)
+            .unwrap()
             .start(signup_name(), signup_version(), signup_input())
             .unwrap();
 
@@ -479,6 +632,7 @@ mod tests {
         let store = MemoryJournal::new();
         let execution = signup_execution();
         let running = Execution::new(&store, execution)
+            .unwrap()
             .start(signup_name(), signup_version(), signup_input())
             .unwrap();
         let output = EventPayload::new(b"done".to_vec());
@@ -497,6 +651,7 @@ mod tests {
         let store = MemoryJournal::new();
         let execution = signup_execution();
         let running = Execution::new(&store, execution)
+            .unwrap()
             .start(signup_name(), signup_version(), signup_input())
             .unwrap();
         let error = WorkflowErrorRecord::new("account creation rolled back");
@@ -516,12 +671,14 @@ mod tests {
         let execution = signup_execution();
         let output = EventPayload::new(b"done".to_vec());
         Execution::new(&store, execution)
+            .unwrap()
             .start(signup_name(), signup_version(), signup_input())
             .unwrap()
             .complete(output.clone())
             .unwrap();
 
-        let recovered = Execution::recover(&store, execution, &signup_version()).unwrap();
+        let recovered =
+            Execution::recover(&store, execution, &signup_name(), &signup_version()).unwrap();
 
         match recovered {
             RecoveredExecution::AlreadyCompleted(_, recovered_output) => {
@@ -537,12 +694,14 @@ mod tests {
         let execution = signup_execution();
         let error = WorkflowErrorRecord::new("account creation rolled back");
         Execution::new(&store, execution)
+            .unwrap()
             .start(signup_name(), signup_version(), signup_input())
             .unwrap()
             .fail(error.clone())
             .unwrap();
 
-        let recovered = Execution::recover(&store, execution, &signup_version()).unwrap();
+        let recovered =
+            Execution::recover(&store, execution, &signup_name(), &signup_version()).unwrap();
 
         match recovered {
             RecoveredExecution::AlreadyFailed(_, recovered_error) => {
@@ -559,6 +718,7 @@ mod tests {
         let execution = signup_execution();
         let charge_card = StepName::new("charge-card").unwrap();
         Execution::new(&store, execution)
+            .unwrap()
             .start(signup_name(), signup_version(), signup_input())
             .unwrap();
         store
@@ -571,10 +731,15 @@ mod tests {
             )
             .unwrap();
 
-        let recovered = Execution::recover(&store, execution, &signup_version()).unwrap();
+        let recovered =
+            Execution::recover(&store, execution, &signup_name(), &signup_version()).unwrap();
 
         match recovered {
-            RecoveredExecution::StillRunning(_, cursor) => {
+            RecoveredExecution::StillRunning(_, cursor, invocation) => {
+                assert_eq!(invocation.id(), execution);
+                assert_eq!(invocation.workflow(), &signup_name());
+                assert_eq!(invocation.version(), &signup_version());
+                assert_eq!(invocation.input(), &signup_input());
                 assert_eq!(
                     cursor.peek(),
                     Some(&JournalEvent::StepScheduled {
@@ -592,11 +757,12 @@ mod tests {
         let store = MemoryJournal::new();
         let execution = signup_execution();
         Execution::new(&store, execution)
+            .unwrap()
             .start(signup_name(), signup_version(), signup_input())
             .unwrap();
         let newer_version = WorkflowVersion::new("2026.08.01").unwrap();
 
-        let result = Execution::recover(&store, execution, &newer_version);
+        let result = Execution::recover(&store, execution, &signup_name(), &newer_version);
 
         assert_eq!(
             result.err(),
@@ -686,7 +852,6 @@ mod tests {
             .recover_and_run(
                 execution,
                 &SignupWorkflow,
-                signup_input(),
                 &unused_clock(),
                 &mut unused_rng(),
             )
@@ -708,6 +873,7 @@ mod tests {
         let store = MemoryJournal::new();
         let execution = signup_execution();
         Execution::new(&store, execution)
+            .unwrap()
             .start(signup_name(), signup_version(), signup_input())
             .unwrap();
         let charge_card = StepName::new("charge-card").unwrap();
@@ -744,7 +910,6 @@ mod tests {
             .recover_and_run(
                 execution,
                 &SignupWorkflow,
-                signup_input(),
                 &unused_clock(),
                 &mut unused_rng(),
             )

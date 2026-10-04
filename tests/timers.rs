@@ -142,6 +142,7 @@ fn recovery_mid_timer_rearms_the_remainder_and_completes_the_workflow_live() {
     // process died mid-wait, so the journal has the deadline but no fired
     // event.
     Execution::new(&store, execution)
+        .unwrap()
         .start(
             renewal_workflow_name(),
             renewal_workflow_version(),
@@ -162,13 +163,7 @@ fn recovery_mid_timer_rearms_the_remainder_and_completes_the_workflow_live() {
     let engine = Engine::<_>::new(&store);
     let workflow = RenewalTimerWorkflow { deadline };
 
-    let result = engine.recover_and_run(
-        execution,
-        &workflow,
-        renewal_input(),
-        &recovery_clock,
-        &mut unused_rng(),
-    );
+    let result = engine.recover_and_run(execution, &workflow, &recovery_clock, &mut unused_rng());
 
     assert_eq!(result.unwrap(), charge_renewal_confirmation());
     assert_eq!(

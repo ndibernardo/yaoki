@@ -159,6 +159,10 @@ impl Journal {
 /// Failures a `JournalStore` can report.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum JournalError {
+    /// Another cooperating execution handle currently owns this stream.
+    #[error("execution {id:?} is already owned")]
+    ExecutionOwned { id: ExecutionId },
+
     #[error("journal store lock poisoned")]
     Poisoned,
 
@@ -177,7 +181,20 @@ pub enum JournalError {
 }
 
 /// Append-only event log, one logical stream per execution.
+/// Engines acquire ownership before accessing a stream. Direct callers must
+/// hold a lease across related loads and appends when access can compete.
+/// An implementation must not offer a no-op lease for shared storage.
 pub trait JournalStore {
+    /// Exclusive ownership released when the lease is dropped.
+    type Lease<'a>
+    where
+        Self: 'a;
+
+    /// Acquires this stream without reading, healing, or appending its journal.
+    /// Refuses a competing owner rather than waiting. File implementations must
+    /// exclude cooperating owners in other processes as well as this one.
+    fn acquire(&self, id: &ExecutionId) -> Result<Self::Lease<'_>, JournalError>;
+
     /// Appends `event` to the execution's log. Returns the 0-based position
     /// the event was appended at.
     fn append(&self, id: &ExecutionId, event: JournalEvent) -> Result<Seq, JournalError>;

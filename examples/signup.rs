@@ -193,13 +193,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // A fresh engine over the surviving journal: charge-payment is answered
     // from the journal, only create-account runs.
     println!("run 2: recover over the same journal");
-    let output = Engine::<_>::new(&store).recover_and_run(
-        execution,
-        &workflow,
-        signup_input(),
-        &clock,
-        &mut rng,
-    );
+    let output = Engine::<_>::new(&store).recover_and_run(execution, &workflow, &clock, &mut rng);
     match output {
         Ok(payload) => println!(
             "  completed: {}",

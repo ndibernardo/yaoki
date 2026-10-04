@@ -239,7 +239,6 @@ fn crash_then_recover(point: CrashPoint) -> Recovered {
         .recover_and_run(
             execution,
             &SignupWorkflow { effects: &effects },
-            signup_input(),
             &signup_clock(),
             &mut unused_rng(),
         )
@@ -278,7 +277,6 @@ fn crash_then_recover_trial(point: CrashPoint) -> Recovered {
         .recover_and_run(
             execution,
             &TrialSignupWorkflow { effects: &effects },
-            signup_input(),
             &signup_clock(),
             &mut unused_rng(),
         )
@@ -405,7 +403,6 @@ fn memory_engine_after_an_effect_interruption_duplicates_the_effect() {
         .recover_and_run(
             execution,
             &SignupWorkflow { effects: &effects },
-            signup_input(),
             &signup_clock(),
             &mut unused_rng(),
         )
@@ -448,7 +445,6 @@ fn recovery_after_two_effect_interruptions_exceeds_the_single_duplicate_allowanc
     let second = Engine::<_>::with_failpoints(&store, &second_policy).recover_and_run(
         execution,
         &SignupWorkflow { effects: &effects },
-        signup_input(),
         &signup_clock(),
         &mut unused_rng(),
     );
@@ -456,7 +452,6 @@ fn recovery_after_two_effect_interruptions_exceeds_the_single_duplicate_allowanc
         .recover_and_run(
             execution,
             &SignupWorkflow { effects: &effects },
-            signup_input(),
             &signup_clock(),
             &mut unused_rng(),
         )
@@ -622,7 +617,6 @@ fn two_crashes_in_the_same_step_accumulate_attempts_and_still_recover() {
     let _second = Engine::<_>::with_failpoints(&store, &second_policy).recover_and_run(
         execution,
         &SignupWorkflow { effects: &effects },
-        signup_input(),
         &signup_clock(),
         &mut unused_rng(),
     );
@@ -631,7 +625,6 @@ fn two_crashes_in_the_same_step_accumulate_attempts_and_still_recover() {
         .recover_and_run(
             execution,
             &SignupWorkflow { effects: &effects },
-            signup_input(),
             &signup_clock(),
             &mut unused_rng(),
         )

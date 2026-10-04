@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 
+use yaoki::context::EngineError;
 use yaoki::context::WorkflowCtx;
 use yaoki::engine::Engine;
 use yaoki::engine::RunError;
@@ -27,7 +28,6 @@ use yaoki::execution::ExecutionId;
 use yaoki::execution::WorkflowName;
 use yaoki::execution::WorkflowVersion;
 use yaoki::journal::EventPayload;
-use yaoki::journal::JournalStore;
 use yaoki::random::RandomBytes;
 use yaoki::random::RngSource;
 use yaoki::step::StepName;
@@ -137,11 +137,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let input = EventPayload::new(br#"{"email":"john.smith@example.com"}"#.to_vec());
 
     let engine = Engine::<_>::new(&store);
-    let journal = store.load(&execution)?;
-    let result = if journal.is_empty() {
-        engine.run(execution, &workflow, input, &clock, &mut rng)
-    } else {
-        engine.recover_and_run(execution, &workflow, input, &clock, &mut rng)
+    let result = match engine.run(execution, &workflow, input, &clock, &mut rng) {
+        Err(RunError::Engine(EngineError::ExistingExecution { .. })) => {
+            engine.recover_and_run(execution, &workflow, &clock, &mut rng)
+        }
+        Ok(output) => Ok(output),
+        Err(error) => Err(error),
     };
 
     match result {

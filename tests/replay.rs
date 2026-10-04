@@ -146,7 +146,6 @@ fn run_fresh_engine(store: &MemoryJournal, recover: bool) -> (EventPayload, Vec<
         engine.recover_and_run(
             signup_execution(),
             &workflow,
-            signup_input(),
             &unused_clock(),
             &mut unused_rng(),
         )

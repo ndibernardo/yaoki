@@ -113,6 +113,7 @@ fn send_receipt_confirmation() -> EventPayload {
 /// died before doing anything else.
 fn seed_crashed_run_after_charge_renewal(store: &MemoryJournal, execution: ExecutionId) {
     Execution::new(store, execution)
+        .unwrap()
         .start(
             renewal_workflow_name(),
             renewal_workflow_version(),
@@ -246,13 +247,7 @@ fn recovery_branching_on_ambient_time_with_a_different_step_name_is_nondetermini
     };
     let unused_clock = TestClock::at(after_deadline_timestamp());
 
-    let result = engine.recover_and_run(
-        execution,
-        &workflow,
-        renewal_input(),
-        &unused_clock,
-        &mut unused_rng(),
-    );
+    let result = engine.recover_and_run(execution, &workflow, &unused_clock, &mut unused_rng());
 
     match result {
         Err(RunError::Workflow(StepError::Engine(EngineError::Nondeterminism {
@@ -281,13 +276,7 @@ fn recovery_branching_on_ambient_time_reading_now_instead_of_a_step_is_nondeterm
     };
     let unused_clock = TestClock::at(after_deadline_timestamp());
 
-    let result = engine.recover_and_run(
-        execution,
-        &workflow,
-        renewal_input(),
-        &unused_clock,
-        &mut unused_rng(),
-    );
+    let result = engine.recover_and_run(execution, &workflow, &unused_clock, &mut unused_rng());
 
     match result {
         Err(RunError::Workflow(StepError::Engine(EngineError::Nondeterminism {
@@ -309,6 +298,7 @@ fn recovery_branching_on_ctx_now_replays_the_journaled_time_and_completes_under_
     let store = MemoryJournal::new();
     let execution = renewal_execution();
     Execution::new(&store, execution)
+        .unwrap()
         .start(
             renewal_workflow_name(),
             renewal_workflow_version(),
@@ -361,7 +351,6 @@ fn recovery_branching_on_ctx_now_replays_the_journaled_time_and_completes_under_
     let result = engine.recover_and_run(
         execution,
         &TimeAwareRenewalWorkflow,
-        renewal_input(),
         &recovery_clock,
         &mut unused_rng(),
     );

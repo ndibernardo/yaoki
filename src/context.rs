@@ -11,6 +11,7 @@ use thiserror::Error;
 
 use crate::command::CommandKind;
 use crate::execution::ExecutionId;
+use crate::execution::WorkflowName;
 use crate::execution::WorkflowVersion;
 use crate::failpoints::CrashPoint;
 use crate::failpoints::CrashStatus;
@@ -82,6 +83,21 @@ pub enum EngineError {
         recorded: WorkflowVersion,
         current: WorkflowVersion,
     },
+
+    #[error("workflow name mismatch: journal {recorded:?}, code {current:?}")]
+    WorkflowMismatch {
+        recorded: WorkflowName,
+        current: WorkflowName,
+    },
+
+    #[error("execution {id:?} does not exist")]
+    MissingExecution { id: ExecutionId },
+
+    #[error("execution {id:?} already exists")]
+    ExistingExecution { id: ExecutionId },
+
+    #[error("execution {id:?} must have exactly one initial start record")]
+    InvalidInvocation { id: ExecutionId },
 
     #[error("journal error: {0}")]
     Journal(#[from] JournalError),
@@ -640,6 +656,12 @@ mod tests {
     struct AlwaysFailingJournal;
 
     impl JournalStore for AlwaysFailingJournal {
+        type Lease<'a> = ();
+
+        fn acquire(&self, _id: &ExecutionId) -> Result<(), JournalError> {
+            Err(JournalError::Poisoned)
+        }
+
         fn append(&self, _id: &ExecutionId, _event: JournalEvent) -> Result<Seq, JournalError> {
             Err(JournalError::Poisoned)
         }

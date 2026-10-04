@@ -38,7 +38,7 @@ fn main() {
     let mut rng = FixedRng { bytes: [0u8; 32] };
     let execution = ExecutionId::generate(&mut rng);
 
-    let running = Execution::new(&store, execution)
+    let running = Execution::new(&store, execution).unwrap()
         .start(renewal_workflow_name(), renewal_workflow_version(), renewal_input())
         .unwrap();
     let completed = running

@@ -3,6 +3,7 @@
 //! Journal contents do not survive process termination.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Mutex;
 
 use crate::execution::ExecutionId;
@@ -17,6 +18,25 @@ use crate::journal::Seq;
 #[derive(Debug, Default)]
 pub struct MemoryJournal {
     executions: Mutex<HashMap<ExecutionId, Vec<JournalEvent>>>,
+    // Ownership spans workflow calls, not just individual journal operations.
+    owners: Mutex<HashSet<ExecutionId>>,
+}
+
+/// Exclusive ownership of one in-memory stream. Dropping it releases the ID.
+pub struct MemoryLease<'a> {
+    store: &'a MemoryJournal,
+    id: ExecutionId,
+}
+
+impl Drop for MemoryLease<'_> {
+    fn drop(&mut self) {
+        let mut owners = match self.store.owners.lock() {
+            Ok(owners) => owners,
+            // Release ownership during unwinding without clearing the poison.
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        owners.remove(&self.id);
+    }
 }
 
 impl MemoryJournal {
@@ -26,6 +46,19 @@ impl MemoryJournal {
 }
 
 impl JournalStore for MemoryJournal {
+    type Lease<'a> = MemoryLease<'a>;
+
+    fn acquire(&self, id: &ExecutionId) -> Result<MemoryLease<'_>, JournalError> {
+        let mut owners = self.owners.lock().map_err(|_| JournalError::Poisoned)?;
+        if !owners.insert(*id) {
+            return Err(JournalError::ExecutionOwned { id: *id });
+        }
+        Ok(MemoryLease {
+            store: self,
+            id: *id,
+        })
+    }
+
     fn append(&self, id: &ExecutionId, event: JournalEvent) -> Result<Seq, JournalError> {
         let mut executions = self.executions.lock().map_err(|_| JournalError::Poisoned)?;
         let events = executions.entry(*id).or_default();
@@ -43,10 +76,15 @@ impl JournalStore for MemoryJournal {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::MemoryJournal;
+    use crate::execution::ExecutionId;
     use crate::execution::WorkflowName;
     use crate::execution::WorkflowVersion;
     use crate::journal::EventPayload;
+    use crate::journal::JournalError;
+    use crate::journal::JournalEvent;
+    use crate::journal::JournalStore;
+    use crate::journal::Seq;
     use crate::random::RandomBytes;
     use crate::random::RngSource;
     use crate::step::StepName;
@@ -89,6 +127,62 @@ mod tests {
             seq: Seq::zero(),
             name: StepName::new(name).unwrap(),
         }
+    }
+
+    #[test]
+    fn acquire_for_different_execution_ids_keeps_their_ownership_independent() {
+        let store = MemoryJournal::new();
+        let signup = store.acquire(&signup_execution()).unwrap();
+        let renewal = store.acquire(&renewal_execution()).unwrap();
+
+        assert_eq!(
+            store.acquire(&signup_execution()).err(),
+            Some(JournalError::ExecutionOwned {
+                id: signup_execution()
+            })
+        );
+        assert_eq!(
+            store.acquire(&renewal_execution()).err(),
+            Some(JournalError::ExecutionOwned {
+                id: renewal_execution()
+            })
+        );
+        drop(signup);
+        assert!(store.acquire(&signup_execution()).is_ok());
+        drop(renewal);
+        assert!(store.acquire(&renewal_execution()).is_ok());
+    }
+
+    #[test]
+    fn acquire_returns_poisoned_error_when_the_ownership_lock_is_poisoned() {
+        let store = MemoryJournal::new();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = store.owners.lock().unwrap();
+            panic!("simulated poisoning while holding the ownership lock");
+        }));
+
+        assert_eq!(
+            store.acquire(&signup_execution()).err(),
+            Some(JournalError::Poisoned)
+        );
+    }
+
+    #[test]
+    fn dropping_a_lease_releases_its_id_even_if_the_ownership_lock_is_poisoned() {
+        let store = MemoryJournal::new();
+        let lease = store.acquire(&signup_execution()).unwrap();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = store.owners.lock().unwrap();
+            panic!("simulated poisoning after ownership acquisition");
+        }));
+
+        drop(lease);
+
+        assert!(store.owners.lock().unwrap_err().into_inner().is_empty());
+        assert_eq!(
+            store.acquire(&signup_execution()).err(),
+            Some(JournalError::Poisoned)
+        );
     }
 
     #[test]
