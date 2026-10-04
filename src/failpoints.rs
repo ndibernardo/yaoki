@@ -123,7 +123,7 @@ mod tests {
     }
 
     fn create_account_seq() -> Seq {
-        Seq::zero().next()
+        Seq::zero().next().unwrap()
     }
 
     #[test]

@@ -305,7 +305,7 @@ fn recovery_branching_on_ctx_now_replays_the_journaled_time_and_completes_under_
         .append(
             &execution,
             JournalEvent::StepScheduled {
-                seq: Seq::zero().next(),
+                seq: Seq::zero().next().unwrap(),
                 name: charge_renewal_name(),
             },
         )
@@ -314,7 +314,7 @@ fn recovery_branching_on_ctx_now_replays_the_journaled_time_and_completes_under_
         .append(
             &execution,
             JournalEvent::StepStarted {
-                seq: Seq::zero().next(),
+                seq: Seq::zero().next().unwrap(),
                 attempt: Attempt::first(),
             },
         )
@@ -323,7 +323,7 @@ fn recovery_branching_on_ctx_now_replays_the_journaled_time_and_completes_under_
         .append(
             &execution,
             JournalEvent::StepCompleted {
-                seq: Seq::zero().next(),
+                seq: Seq::zero().next().unwrap(),
                 result: charge_renewal_confirmation(),
             },
         )

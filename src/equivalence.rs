@@ -217,7 +217,7 @@ mod tests {
 
     fn record_receipt(trace: &mut EffectTrace) {
         trace.record(
-            renewal_key(Seq::zero().next()),
+            renewal_key(Seq::zero().next().unwrap()),
             send_receipt(),
             send_receipt_confirmation(),
         );
@@ -250,7 +250,7 @@ mod tests {
                     charge_renewal_confirmation()
                 ),
                 EffectRecord::new(
-                    renewal_key(Seq::zero().next()),
+                    renewal_key(Seq::zero().next().unwrap()),
                     send_receipt(),
                     send_receipt_confirmation()
                 ),

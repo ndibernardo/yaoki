@@ -6,6 +6,7 @@ pub mod engine;
 pub mod equivalence;
 pub mod execution;
 pub mod failpoints;
+pub mod history;
 pub mod journal;
 pub mod random;
 pub mod step;

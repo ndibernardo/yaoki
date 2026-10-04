@@ -7,11 +7,11 @@ use std::collections::HashSet;
 use std::sync::Mutex;
 
 use crate::execution::ExecutionId;
+use crate::journal::EventOffset;
 use crate::journal::Journal;
 use crate::journal::JournalError;
 use crate::journal::JournalEvent;
 use crate::journal::JournalStore;
-use crate::journal::Seq;
 
 /// `Mutex<HashMap<ExecutionId, Vec<JournalEvent>>>`. Mutex is justified:
 /// genuinely shared mutable state across engine tasks.
@@ -59,10 +59,10 @@ impl JournalStore for MemoryJournal {
         })
     }
 
-    fn append(&self, id: &ExecutionId, event: JournalEvent) -> Result<Seq, JournalError> {
+    fn append(&self, id: &ExecutionId, event: JournalEvent) -> Result<EventOffset, JournalError> {
         let mut executions = self.executions.lock().map_err(|_| JournalError::Poisoned)?;
         let events = executions.entry(*id).or_default();
-        let position = Seq::from_index(events.len() as u64);
+        let position = EventOffset::from_index(events.len());
         events.push(event);
         Ok(position)
     }

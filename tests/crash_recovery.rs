@@ -411,7 +411,7 @@ fn memory_engine_after_an_effect_interruption_duplicates_the_effect() {
     let observed = effects.into_inner();
     let mut expected = EffectTrace::new();
     let charge_key = IdempotencyKey::new(execution, Seq::zero());
-    let account_key = IdempotencyKey::new(execution, Seq::zero().next());
+    let account_key = IdempotencyKey::new(execution, Seq::zero().next().unwrap());
     expected.record(charge_key, charge_card(), charge_confirmation());
     expected.record(charge_key, charge_card(), charge_confirmation());
     expected.record(account_key, create_account(), account_created());
@@ -468,7 +468,7 @@ fn recovery_after_two_effect_interruptions_exceeds_the_single_duplicate_allowanc
     let observed = effects.into_inner();
     let mut expected = EffectTrace::new();
     let charge_key = IdempotencyKey::new(execution, Seq::zero());
-    let account_key = IdempotencyKey::new(execution, Seq::zero().next());
+    let account_key = IdempotencyKey::new(execution, Seq::zero().next().unwrap());
     expected.record(charge_key, charge_card(), charge_confirmation());
     expected.record(charge_key, charge_card(), charge_confirmation());
     expected.record(charge_key, charge_card(), charge_confirmation());
@@ -507,7 +507,7 @@ fn exact_trace_predicate_with_repeated_equal_records_accepts_exact_trace_equalit
 fn ordered_retries_with_distinct_equal_operations_accepts_exact_trace_equality() {
     let mut reference = EffectTrace::new();
     let first = IdempotencyKey::new(signup_execution(), Seq::zero());
-    let second = IdempotencyKey::new(signup_execution(), Seq::zero().next());
+    let second = IdempotencyKey::new(signup_execution(), Seq::zero().next().unwrap());
     reference.record(first, charge_card(), charge_confirmation());
     reference.record(second, charge_card(), charge_confirmation());
     let observed = reference.clone();
@@ -519,7 +519,7 @@ fn ordered_retries_with_distinct_equal_operations_accepts_exact_trace_equality()
 fn crash_after_the_side_effect_of_the_final_step_duplicates_the_trailing_effect() {
     let reference = signup_reference_trace();
 
-    let recovered = crash_then_recover(CrashPoint::AfterSideEffect(Seq::zero().next()));
+    let recovered = crash_then_recover(CrashPoint::AfterSideEffect(Seq::zero().next().unwrap()));
 
     assert_eq!(recovered.effects.records().len(), 3);
     assert!(SingleAdjacentDuplicate::matches(

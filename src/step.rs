@@ -51,6 +51,11 @@ pub enum AttemptError {
     Zero,
 }
 
+/// A retry attempt has no representable successor.
+#[derive(Debug, Error, PartialEq, Eq)]
+#[error("attempt counter overflow")]
+pub struct AttemptOverflow;
+
 impl Attempt {
     /// The first attempt of a step.
     pub fn first() -> Self {
@@ -65,8 +70,19 @@ impl Attempt {
         Ok(Self(n))
     }
 
-    pub fn next(self) -> Self {
-        Self(self.0 + 1)
+    /// Returns the successor, or an overflow error at `u32::MAX`.
+    /// Advancing cannot produce a constructor's zero-attempt error.
+    ///
+    /// ```compile_fail
+    /// use yaoki::step::Attempt;
+    /// use yaoki::step::AttemptError;
+    ///
+    /// fn advance(attempt: Attempt) -> Result<Attempt, AttemptError> {
+    ///     attempt.next()
+    /// }
+    /// ```
+    pub fn next(self) -> Result<Self, AttemptOverflow> {
+        self.0.checked_add(1).map(Self).ok_or(AttemptOverflow)
     }
 
     pub fn get(self) -> u32 {
@@ -125,7 +141,17 @@ pub enum StepError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use proptest::proptest;
+
+    use super::Attempt;
+    use super::AttemptError;
+    use super::AttemptOverflow;
+    use super::IdempotencyKey;
+    use super::StepErrorRecord;
+    use super::StepName;
+    use super::StepNameError;
+    use crate::execution::ExecutionId;
+    use crate::journal::Seq;
     use crate::random::RandomBytes;
     use crate::random::RngSource;
 
@@ -172,6 +198,38 @@ mod tests {
         );
     }
 
+    proptest! {
+        #[test]
+        fn attempt_next_matches_checked_arithmetic(raw in 1u32..=u32::MAX) {
+            let attempt = Attempt::new(raw).unwrap();
+
+            let result = attempt.next();
+
+            let expected = raw.checked_add(1)
+                .map(|number| Attempt::new(number).unwrap())
+                .ok_or(AttemptOverflow);
+            assert_eq!(result, expected);
+        }
+    }
+
+    #[test]
+    fn attempt_next_before_the_maximum_returns_the_last_attempt() {
+        let penultimate = Attempt::new(u32::MAX - 1).unwrap();
+
+        let result = penultimate.next();
+
+        assert_eq!(result, Ok(Attempt::new(u32::MAX).unwrap()));
+    }
+
+    #[test]
+    fn attempt_next_at_the_maximum_returns_a_typed_overflow_error() {
+        let last = Attempt::new(u32::MAX).unwrap();
+
+        let result = last.next();
+
+        assert_eq!(result, Err(AttemptOverflow));
+    }
+
     #[test]
     fn attempt_first_is_one() {
         assert_eq!(Attempt::first().get(), 1);
@@ -195,7 +253,7 @@ mod tests {
     fn attempt_next_increments() {
         let first = Attempt::first();
 
-        let second = first.next();
+        let second = first.next().unwrap();
 
         assert_eq!(second.get(), 2);
     }
@@ -213,7 +271,7 @@ mod tests {
             bytes: charge_card_bytes(),
         };
         let execution = ExecutionId::generate(&mut rng);
-        let seq = Seq::zero().next();
+        let seq = Seq::zero().next().unwrap();
 
         let key = IdempotencyKey::new(execution, seq);
 

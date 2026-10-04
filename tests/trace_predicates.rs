@@ -49,7 +49,10 @@ fn charge_trace(keys: &[IdempotencyKey]) -> EffectTrace {
 
 fn renewal_reference() -> EffectTrace {
     // Two subscription renewals can have the same step name and result.
-    charge_trace(&[renewal_key(Seq::zero()), renewal_key(Seq::zero().next())])
+    charge_trace(&[
+        renewal_key(Seq::zero()),
+        renewal_key(Seq::zero().next().unwrap()),
+    ])
 }
 
 #[test]
@@ -81,7 +84,10 @@ fn ordered_retries_with_a_missing_equal_valued_operation_rejects_the_trace() {
 #[test]
 fn ordered_retries_with_reordered_equal_valued_operations_rejects_the_trace() {
     let reference = renewal_reference();
-    let observed = charge_trace(&[renewal_key(Seq::zero().next()), renewal_key(Seq::zero())]);
+    let observed = charge_trace(&[
+        renewal_key(Seq::zero().next().unwrap()),
+        renewal_key(Seq::zero()),
+    ]);
 
     assert!(!OrderedRetries::matches(&observed, &reference));
 }
@@ -90,7 +96,7 @@ fn ordered_retries_with_reordered_equal_valued_operations_rejects_the_trace() {
 fn ordered_retries_with_nonadjacent_identical_retries_accepts_the_trace() {
     let reference = renewal_reference();
     let first = renewal_key(Seq::zero());
-    let second = renewal_key(Seq::zero().next());
+    let second = renewal_key(Seq::zero().next().unwrap());
     let observed = charge_trace(&[first, first, second, first, second]);
 
     assert!(OrderedRetries::matches(&observed, &reference));
@@ -155,7 +161,7 @@ fn ordered_retries_with_an_unknown_sequence_rejects_the_trace() {
     let reference = renewal_reference();
     let mut observed = reference.clone();
     observed.record(
-        renewal_key(Seq::zero().next().next()),
+        renewal_key(Seq::zero().next().unwrap().next().unwrap()),
         charge_name(),
         charge_result(),
     );
@@ -249,7 +255,7 @@ proptest! {
         let keys: Vec<_> = (0..4)
             .scan(Seq::zero(), |seq, _| {
                 let key = renewal_key(*seq);
-                *seq = seq.next();
+                *seq = seq.next().unwrap();
                 Some(key)
             })
             .collect();
@@ -275,7 +281,7 @@ proptest! {
         let keys: Vec<_> = (0..10)
             .scan(Seq::zero(), |seq, _| {
                 let key = renewal_key(*seq);
-                *seq = seq.next();
+                *seq = seq.next().unwrap();
                 Some(key)
             })
             .collect();

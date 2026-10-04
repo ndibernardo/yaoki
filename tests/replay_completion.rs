@@ -124,7 +124,7 @@ fn account_suffixes(seq: Seq) -> Vec<Vec<JournalEvent>> {
             started.clone(),
             JournalEvent::StepStarted {
                 seq,
-                attempt: Attempt::first().next(),
+                attempt: Attempt::first().next().unwrap(),
             },
         ],
         vec![
@@ -209,12 +209,12 @@ proptest! {
     ) {
         let store = MemoryJournal::new();
         let mut commands = completed_charge();
-        let mut seq = Seq::zero().next();
+        let mut seq = Seq::zero().next().unwrap();
         for kind in settled_commands {
             // Only the last command may be interrupted.
             let settled_indices = [3, 4, 5, 6, 8];
             commands.extend(account_suffixes(seq).remove(settled_indices[kind]));
-            seq = seq.next();
+            seq = seq.next().unwrap();
         }
         commands.extend(account_suffixes(seq).remove(final_prefix));
         seed_signup(&store, commands);
@@ -231,7 +231,7 @@ proptest! {
 
 #[test]
 fn recovery_early_success_with_each_recorded_suffix_refuses_terminal_append() {
-    for suffix in account_suffixes(Seq::zero().next()) {
+    for suffix in account_suffixes(Seq::zero().next().unwrap()) {
         let store = MemoryJournal::new();
         seed_signup(
             &store,
@@ -248,7 +248,7 @@ fn recovery_early_success_with_each_recorded_suffix_refuses_terminal_append() {
 
 #[test]
 fn recovery_early_business_failure_with_each_recorded_suffix_refuses_terminal_append() {
-    for suffix in account_suffixes(Seq::zero().next()) {
+    for suffix in account_suffixes(Seq::zero().next().unwrap()) {
         let store = MemoryJournal::new();
         seed_signup(
             &store,

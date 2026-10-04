@@ -18,15 +18,20 @@ use crate::failpoints::CrashStatus;
 use crate::failpoints::FailpointDecision;
 use crate::failpoints::FailpointPolicy;
 use crate::failpoints::NeverCrash;
+use crate::history::HistoryError;
+use crate::history::ReplayHistory;
+use crate::journal::EventOffset;
 use crate::journal::EventPayload;
 use crate::journal::Journal;
 use crate::journal::JournalError;
 use crate::journal::JournalEvent;
 use crate::journal::JournalStore;
 use crate::journal::Seq;
+use crate::journal::SeqError;
 use crate::random::RandomBytes;
 use crate::random::RngSource;
 use crate::step::Attempt;
+use crate::step::AttemptOverflow;
 use crate::step::IdempotencyKey;
 use crate::step::StepError;
 use crate::step::StepErrorRecord;
@@ -38,31 +43,58 @@ use crate::time::Timestamp;
 /// Walks a loaded `Journal` command by command during replay.
 #[derive(Debug, Clone)]
 pub struct ReplayCursor {
-    events: Vec<JournalEvent>,
-    position: usize,
+    source: ReplaySource,
+    position: EventOffset,
+}
+
+#[derive(Debug, Clone)]
+enum ReplaySource {
+    Raw(Journal),
+    Validated(ReplayHistory),
+}
+
+impl ReplaySource {
+    fn events(&self) -> &[JournalEvent] {
+        match self {
+            Self::Raw(journal) => journal.events(),
+            Self::Validated(history) => history.events(),
+        }
+    }
 }
 
 impl ReplayCursor {
+    /// Walks raw command events without validating their grammar.
+    /// Engine recovery uses a parsed history instead of this low-level constructor.
     pub fn new(journal: Journal) -> Self {
         Self {
-            events: journal.events().to_vec(),
-            position: 0,
+            source: ReplaySource::Raw(journal),
+            position: EventOffset::from_index(0),
+        }
+    }
+
+    /// Retains a parsed history and begins immediately after its invocation.
+    pub(crate) fn from_history(history: ReplayHistory) -> Self {
+        Self {
+            source: ReplaySource::Validated(history),
+            position: EventOffset::from_index(1),
         }
     }
 
     /// True once every journaled event has been consumed.
     pub fn is_exhausted(&self) -> bool {
-        self.position >= self.events.len()
+        self.position.get() >= self.source.events().len()
     }
 
     /// The next unconsumed event, without advancing.
     pub fn peek(&self) -> Option<&JournalEvent> {
-        self.events.get(self.position)
+        self.source.events().get(self.position.get())
     }
 
-    /// Consumes the event returned by the last `peek`.
+    /// Consumes the current event. An exhausted cursor remains exhausted.
     pub fn advance(&mut self) {
-        self.position += 1;
+        if !self.is_exhausted() {
+            self.position = EventOffset::from_index(self.position.get() + 1);
+        }
     }
 }
 
@@ -102,6 +134,18 @@ pub enum EngineError {
 
     #[error("execution {id:?} must have exactly one initial start record")]
     InvalidInvocation { id: ExecutionId },
+
+    /// A command position has no successor.
+    #[error("{0}")]
+    Sequence(#[from] SeqError),
+
+    /// An interrupted step has no next attempt.
+    #[error("{0}")]
+    Attempt(#[from] AttemptOverflow),
+
+    /// The recorded event grammar is invalid.
+    #[error("invalid execution history: {0}")]
+    History(#[from] HistoryError),
 
     #[error("journal error: {0}")]
     Journal(#[from] JournalError),
@@ -277,7 +321,7 @@ impl<'a, S: JournalStore> WorkflowCtx<'a, S> {
     pub fn now(&mut self) -> Result<Timestamp, EngineError> {
         self.refuse_after_crash()?;
         let seq = self.seq;
-        self.seq = self.seq.next();
+        self.seq = self.seq.next().map_err(EngineError::from)?;
 
         let decision = match &mut self.mode {
             Mode::Replaying(cursor) => match cursor.peek().cloned() {
@@ -319,7 +363,7 @@ impl<'a, S: JournalStore> WorkflowCtx<'a, S> {
     pub fn random(&mut self) -> Result<RandomBytes, EngineError> {
         self.refuse_after_crash()?;
         let seq = self.seq;
-        self.seq = self.seq.next();
+        self.seq = self.seq.next().map_err(EngineError::from)?;
 
         let decision = match &mut self.mode {
             Mode::Replaying(cursor) => match cursor.peek().cloned() {
@@ -362,7 +406,7 @@ impl<'a, S: JournalStore> WorkflowCtx<'a, S> {
     pub fn sleep_until(&mut self, deadline: Deadline) -> Result<(), EngineError> {
         self.refuse_after_crash()?;
         let seq = self.seq;
-        self.seq = self.seq.next();
+        self.seq = self.seq.next().map_err(EngineError::from)?;
 
         let decision = match &mut self.mode {
             Mode::Replaying(cursor) => match cursor.peek().cloned() {
@@ -438,7 +482,7 @@ impl<'a, S: JournalStore> WorkflowCtx<'a, S> {
     {
         self.refuse_after_crash().map_err(StepError::Engine)?;
         let seq = self.seq;
-        self.seq = self.seq.next();
+        self.seq = self.seq.next().map_err(EngineError::from)?;
 
         let decision = match &mut self.mode {
             Mode::Replaying(cursor) => match cursor.peek().cloned() {
@@ -482,10 +526,10 @@ impl<'a, S: JournalStore> WorkflowCtx<'a, S> {
         // Every `StepStarted` at this position is one attempt; a crash-cut
         // attempt leaves its `StepStarted` behind with no outcome after it,
         // so several can accumulate before one completes.
-        let mut attempts: u32 = 0;
-        while matches!(cursor.peek(), Some(JournalEvent::StepStarted { .. })) {
+        let mut next_attempt = Ok(Attempt::first());
+        while let Some(JournalEvent::StepStarted { attempt, .. }) = cursor.peek() {
+            next_attempt = attempt.next();
             cursor.advance();
-            attempts += 1;
         }
         match cursor.peek().cloned() {
             Some(JournalEvent::StepCompleted { result, .. }) => {
@@ -508,8 +552,11 @@ impl<'a, S: JournalStore> WorkflowCtx<'a, S> {
             // `StepScheduled` (`CrashPoint::AfterStepScheduled`) or after
             // `StepStarted` (`AfterStepStarted` / `AfterSideEffect`). No
             // outcome was recorded either way, so rerun as the next attempt.
-            None => ReplayedStep::Rerun {
-                attempt: (0..attempts).fold(Attempt::first(), |attempt, _| attempt.next()),
+            None => match next_attempt {
+                Ok(attempt) => ReplayedStep::Rerun { attempt },
+                Err(error) => {
+                    ReplayedStep::Recorded(Err(StepError::Engine(EngineError::Attempt(error))))
+                }
             },
         }
     }
@@ -680,13 +727,156 @@ mod tests {
             Err(JournalError::Poisoned)
         }
 
-        fn append(&self, _id: &ExecutionId, _event: JournalEvent) -> Result<Seq, JournalError> {
+        fn append(
+            &self,
+            _id: &ExecutionId,
+            _event: JournalEvent,
+        ) -> Result<EventOffset, JournalError> {
             Err(JournalError::Poisoned)
         }
 
         fn load(&self, _id: &ExecutionId) -> Result<Journal, JournalError> {
             Err(JournalError::Poisoned)
         }
+    }
+
+    struct ForbiddenEffects;
+
+    impl Clock for ForbiddenEffects {
+        fn now(&self) -> Timestamp {
+            panic!("an exhausted command position must not read the clock")
+        }
+
+        fn sleep_until(&self, _deadline: Timestamp) {
+            panic!("an exhausted command position must not wait")
+        }
+    }
+
+    impl RngSource for ForbiddenEffects {
+        fn next_bytes(&mut self) -> RandomBytes {
+            panic!("an exhausted command position must not draw randomness")
+        }
+    }
+
+    #[test]
+    fn every_command_at_the_maximum_sequence_refuses_before_effects_or_appends() {
+        for command in [
+            CommandKind::RunStep,
+            CommandKind::ReadNow,
+            CommandKind::DrawRandom,
+            CommandKind::Sleep,
+        ] {
+            let store = MemoryJournal::new();
+            let execution = signup_execution();
+            let mut rng = ForbiddenEffects;
+            let mut ctx = WorkflowCtx::new(
+                &store,
+                execution,
+                ReplayCursor::new(Journal::empty()),
+                &ForbiddenEffects,
+                &mut rng,
+            );
+            let last = Seq::from_record(u64::MAX);
+            ctx.seq = last;
+
+            let result = match command {
+                CommandKind::RunStep => match ctx.step(charge_card(), |_key| {
+                    panic!("an exhausted command position must not run a step")
+                }) {
+                    Ok(_) => Ok(()),
+                    Err(StepError::Engine(error)) => Err(error),
+                    Err(StepError::Failed(error)) => {
+                        panic!("unexpected business failure: {error:?}")
+                    }
+                },
+                CommandKind::ReadNow => ctx.now().map(|_| ()),
+                CommandKind::DrawRandom => ctx.random().map(|_| ()),
+                CommandKind::Sleep => ctx.sleep_until(Deadline::at(charge_renewal_deadline())),
+            };
+
+            assert_eq!(result, Err(EngineError::Sequence(SeqError::Overflow)));
+            assert_eq!(ctx.seq, last);
+            assert!(store.load(&execution).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn raw_cursor_with_an_interrupted_maximum_attempt_refuses_a_live_retry() {
+        let store = MemoryJournal::new();
+        let execution = signup_execution();
+        let clock = unused_clock();
+        let mut rng = unused_rng();
+        let mut ctx = WorkflowCtx::new(
+            &store,
+            execution,
+            ReplayCursor::new(Journal::new(vec![
+                JournalEvent::StepScheduled {
+                    seq: Seq::zero(),
+                    name: charge_card(),
+                },
+                JournalEvent::StepStarted {
+                    seq: Seq::zero(),
+                    attempt: Attempt::new(u32::MAX).unwrap(),
+                },
+            ])),
+            &clock,
+            &mut rng,
+        );
+
+        let result = ctx.step(charge_card(), |_key| {
+            panic!("an exhausted attempt must not run again")
+        });
+
+        assert_eq!(
+            result,
+            Err(StepError::Engine(EngineError::Attempt(AttemptOverflow)))
+        );
+        assert!(store.load(&execution).unwrap().is_empty());
+    }
+
+    #[test]
+    fn raw_cursor_with_a_settled_maximum_attempt_returns_its_recorded_result() {
+        let store = MemoryJournal::new();
+        let execution = signup_execution();
+        let clock = unused_clock();
+        let mut rng = unused_rng();
+        let mut ctx = WorkflowCtx::new(
+            &store,
+            execution,
+            ReplayCursor::new(Journal::new(vec![
+                JournalEvent::StepScheduled {
+                    seq: Seq::zero(),
+                    name: charge_card(),
+                },
+                JournalEvent::StepStarted {
+                    seq: Seq::zero(),
+                    attempt: Attempt::new(u32::MAX).unwrap(),
+                },
+                JournalEvent::StepCompleted {
+                    seq: Seq::zero(),
+                    result: charge_confirmation(),
+                },
+            ])),
+            &clock,
+            &mut rng,
+        );
+
+        let result = ctx.step(charge_card(), |_key| {
+            panic!("a settled step must not run again")
+        });
+
+        assert_eq!(result, Ok(charge_confirmation()));
+        assert!(store.load(&execution).unwrap().is_empty());
+    }
+
+    #[test]
+    fn advance_on_an_exhausted_cursor_preserves_its_event_offset() {
+        let mut cursor = ReplayCursor::new(Journal::empty());
+
+        cursor.advance();
+
+        assert_eq!(cursor.position.get(), 0);
+        assert!(cursor.is_exhausted());
     }
 
     #[test]
@@ -1016,15 +1206,15 @@ mod tests {
             journal.events(),
             &[
                 JournalEvent::StepScheduled {
-                    seq: Seq::zero().next(),
+                    seq: Seq::zero().next().unwrap(),
                     name: create_account,
                 },
                 JournalEvent::StepStarted {
-                    seq: Seq::zero().next(),
+                    seq: Seq::zero().next().unwrap(),
                     attempt: Attempt::first(),
                 },
                 JournalEvent::StepCompleted {
-                    seq: Seq::zero().next(),
+                    seq: Seq::zero().next().unwrap(),
                     result: account_created,
                 },
             ]
@@ -1070,7 +1260,7 @@ mod tests {
             &[
                 JournalEvent::StepStarted {
                     seq: Seq::zero(),
-                    attempt: Attempt::first().next(),
+                    attempt: Attempt::first().next().unwrap(),
                 },
                 JournalEvent::StepCompleted {
                     seq: Seq::zero(),
@@ -1097,7 +1287,7 @@ mod tests {
             },
             JournalEvent::StepStarted {
                 seq: Seq::zero(),
-                attempt: Attempt::first().next(),
+                attempt: Attempt::first().next().unwrap(),
             },
         ]);
         let clock = unused_clock();
@@ -1117,7 +1307,7 @@ mod tests {
             store.load(&execution).unwrap().events().first(),
             Some(&JournalEvent::StepStarted {
                 seq: Seq::zero(),
-                attempt: Attempt::first().next().next(),
+                attempt: Attempt::first().next().unwrap().next().unwrap(),
             })
         );
     }
@@ -1139,7 +1329,7 @@ mod tests {
             },
             JournalEvent::StepStarted {
                 seq: Seq::zero(),
-                attempt: Attempt::first().next(),
+                attempt: Attempt::first().next().unwrap(),
             },
             JournalEvent::StepCompleted {
                 seq: Seq::zero(),
@@ -1384,7 +1574,7 @@ mod tests {
         assert_eq!(
             journal.events(),
             &[JournalEvent::NowRecorded {
-                seq: Seq::zero().next(),
+                seq: Seq::zero().next().unwrap(),
                 value: charge_renewal_deadline(),
             }]
         );
@@ -1710,11 +1900,11 @@ mod tests {
             journal.events(),
             &[
                 JournalEvent::TimerScheduled {
-                    seq: Seq::zero().next(),
+                    seq: Seq::zero().next().unwrap(),
                     deadline,
                 },
                 JournalEvent::TimerFired {
-                    seq: Seq::zero().next(),
+                    seq: Seq::zero().next().unwrap(),
                 },
             ]
         );
@@ -2151,7 +2341,7 @@ mod tests {
         let execution = signup_execution();
         let clock = unused_clock();
         let mut rng = unused_rng();
-        let policy = CrashOnce::new(CrashPoint::AfterSideEffect(Seq::zero().next()));
+        let policy = CrashOnce::new(CrashPoint::AfterSideEffect(Seq::zero().next().unwrap()));
         let effects = EffectCounter::new();
         let mut ctx = crashing_ctx(&store, execution, &clock, &mut rng, &policy);
 

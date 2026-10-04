@@ -21,22 +21,63 @@ use crate::time::Timestamp;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Seq(u64);
 
+/// A command position has no representable successor.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum SeqError {
+    /// The current position is `u64::MAX`.
+    #[error("command position overflow")]
+    Overflow,
+}
+
 impl Seq {
     pub fn zero() -> Self {
         Self(0)
     }
 
-    pub fn next(self) -> Self {
-        Self(self.0 + 1)
+    /// Returns the successor, or `SeqError::Overflow` at `u64::MAX`.
+    pub fn next(self) -> Result<Self, SeqError> {
+        self.0.checked_add(1).map(Self).ok_or(SeqError::Overflow)
     }
 
     pub fn get(self) -> u64 {
         self.0
     }
 
-    /// Builds a `Seq` from a store's raw append position. Store-internal:
-    /// callers outside this crate never construct a `Seq` out of thin air.
-    pub(crate) fn from_index(index: u64) -> Self {
+    /// Reads a stored command position; history parsing checks its ordering.
+    pub(crate) fn from_record(position: u64) -> Self {
+        Self(position)
+    }
+}
+
+/// Zero-based event offset, independent of a command's position.
+///
+/// ```compile_fail
+/// use yaoki::journal::EventOffset;
+/// use yaoki::journal::Seq;
+///
+/// fn command_position(offset: EventOffset) -> Seq {
+///     offset
+/// }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct EventOffset(usize);
+
+impl EventOffset {
+    /// Returns the event's index in append order.
+    pub fn get(self) -> usize {
+        self.0
+    }
+
+    /// Constructs an append offset for storage implementations.
+    /// Every `usize` index is representable; this does not validate history order.
+    ///
+    /// ```
+    /// use yaoki::journal::EventOffset;
+    ///
+    /// let completion_offset = EventOffset::from_index(3);
+    /// assert_eq!(completion_offset.get(), 3);
+    /// ```
+    pub fn from_index(index: usize) -> Self {
         Self(index)
     }
 }
@@ -197,7 +238,7 @@ pub trait JournalStore {
 
     /// Appends `event` to the execution's log. Returns the 0-based position
     /// the event was appended at.
-    fn append(&self, id: &ExecutionId, event: JournalEvent) -> Result<Seq, JournalError>;
+    fn append(&self, id: &ExecutionId, event: JournalEvent) -> Result<EventOffset, JournalError>;
 
     /// Loads the full event history for `id`. An execution with no events
     /// yet (never started) loads as an empty `Journal`, not an error.
@@ -206,7 +247,44 @@ pub trait JournalStore {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use proptest::proptest;
+
+    use super::EventOffset;
+    use super::EventPayload;
+    use super::Journal;
+    use super::JournalEvent;
+    use super::Seq;
+    use super::SeqError;
+    use crate::command::CommandKind;
+    use crate::execution::WorkflowErrorRecord;
+    use crate::execution::WorkflowName;
+    use crate::execution::WorkflowVersion;
+    use crate::random::RandomBytes;
+    use crate::step::Attempt;
+    use crate::step::StepErrorRecord;
+    use crate::step::StepName;
+    use crate::time::Deadline;
+    use crate::time::Timestamp;
+
+    proptest! {
+        #[test]
+        fn seq_next_matches_checked_arithmetic(raw in proptest::prelude::any::<u64>()) {
+            let seq = Seq::from_record(raw);
+
+            let result = seq.next();
+
+            assert_eq!(result, raw.checked_add(1).map(Seq::from_record).ok_or(SeqError::Overflow));
+        }
+    }
+
+    #[test]
+    fn seq_next_before_the_maximum_returns_the_last_position() {
+        let penultimate = Seq::from_record(u64::MAX - 1);
+
+        let result = penultimate.next();
+
+        assert_eq!(result, Ok(Seq::from_record(u64::MAX)));
+    }
 
     #[test]
     fn seq_zero_starts_at_zero() {
@@ -217,9 +295,25 @@ mod tests {
     fn seq_next_increments_by_one() {
         let first = Seq::zero();
 
-        let second = first.next();
+        let second = first.next().unwrap();
 
         assert_eq!(second.get(), 1);
+    }
+
+    #[test]
+    fn seq_next_at_the_maximum_returns_a_typed_overflow_error() {
+        let last = Seq::from_record(u64::MAX);
+
+        let result = last.next();
+
+        assert_eq!(result, Err(SeqError::Overflow));
+    }
+
+    #[test]
+    fn event_offset_retains_an_event_position_independently_of_command_seq() {
+        let offset = EventOffset::from_index(3);
+
+        assert_eq!(offset.get(), 3);
     }
 
     #[test]

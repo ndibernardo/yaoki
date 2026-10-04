@@ -28,6 +28,7 @@ use crate::execution::ExecutionId;
 use crate::execution::WorkflowErrorRecord;
 use crate::execution::WorkflowName;
 use crate::execution::WorkflowVersion;
+use crate::journal::EventOffset;
 use crate::journal::EventPayload;
 use crate::journal::Journal;
 use crate::journal::JournalError;
@@ -164,15 +165,15 @@ impl TryFrom<JournalEventRecord> for JournalEvent {
                 input: EventPayload::new(input),
             }),
             JournalEventRecord::StepScheduled { seq, name } => Ok(JournalEvent::StepScheduled {
-                seq: Seq::from_index(seq),
+                seq: Seq::from_record(seq),
                 name: StepName::new(name).map_err(|e| malformed(e.to_string()))?,
             }),
             JournalEventRecord::StepStarted { seq, attempt } => Ok(JournalEvent::StepStarted {
-                seq: Seq::from_index(seq),
+                seq: Seq::from_record(seq),
                 attempt: Attempt::new(attempt).map_err(|e| malformed(e.to_string()))?,
             }),
             JournalEventRecord::StepCompleted { seq, result } => Ok(JournalEvent::StepCompleted {
-                seq: Seq::from_index(seq),
+                seq: Seq::from_record(seq),
                 result: EventPayload::new(result),
             }),
             JournalEventRecord::StepFailed {
@@ -180,26 +181,26 @@ impl TryFrom<JournalEventRecord> for JournalEvent {
                 attempt,
                 error,
             } => Ok(JournalEvent::StepFailed {
-                seq: Seq::from_index(seq),
+                seq: Seq::from_record(seq),
                 attempt: Attempt::new(attempt).map_err(|e| malformed(e.to_string()))?,
                 error: StepErrorRecord::new(error),
             }),
             JournalEventRecord::NowRecorded { seq, value } => Ok(JournalEvent::NowRecorded {
-                seq: Seq::from_index(seq),
+                seq: Seq::from_record(seq),
                 value: Timestamp::from_millis_since_epoch(value),
             }),
             JournalEventRecord::RandomRecorded { seq, value } => Ok(JournalEvent::RandomRecorded {
-                seq: Seq::from_index(seq),
+                seq: Seq::from_record(seq),
                 value: RandomBytes::new(value),
             }),
             JournalEventRecord::TimerScheduled { seq, deadline } => {
                 Ok(JournalEvent::TimerScheduled {
-                    seq: Seq::from_index(seq),
+                    seq: Seq::from_record(seq),
                     deadline: Deadline::at(Timestamp::from_millis_since_epoch(deadline)),
                 })
             }
             JournalEventRecord::TimerFired { seq } => Ok(JournalEvent::TimerFired {
-                seq: Seq::from_index(seq),
+                seq: Seq::from_record(seq),
             }),
             JournalEventRecord::ExecutionCompleted { output } => {
                 Ok(JournalEvent::ExecutionCompleted {
@@ -397,10 +398,10 @@ impl JournalStore for FileJournal {
         Ok(FileLease { lock })
     }
 
-    fn append(&self, id: &ExecutionId, event: JournalEvent) -> Result<Seq, JournalError> {
+    fn append(&self, id: &ExecutionId, event: JournalEvent) -> Result<EventOffset, JournalError> {
         let path = self.path_for(id);
         let existing = Self::read_and_heal(&path)?;
-        let position = Seq::from_index(existing.len() as u64);
+        let position = EventOffset::from_index(existing.len());
 
         let record = JournalEventRecord::from(&event);
         let payload = serde_json::to_vec(&record).map_err(|e| JournalError::Codec {

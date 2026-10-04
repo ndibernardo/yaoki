@@ -109,10 +109,10 @@ fn confirmation_of(step: &StepName) -> EventPayload {
     EventPayload::new(format!(r#"{{"step":"{}","status":"done"}}"#, step.as_str()).into_bytes())
 }
 
-/// The `Seq` of the `index`-th command. `Seq::from_index` is crate-private,
+/// The `Seq` of the `index`-th command. `Seq::from_record` is crate-private,
 /// so positions are reached by stepping from zero.
 fn seq_at(index: usize) -> Seq {
-    (0..index).fold(Seq::zero(), |seq, _| seq.next())
+    (0..index).fold(Seq::zero(), |seq, _| seq.next().unwrap())
 }
 
 /// Runs its steps in order, recording every execution of every step body in
@@ -357,7 +357,7 @@ fn recovery_of_equal_named_steps_keeps_distinct_operations_and_stable_retry_keys
     let (observed, output) = crash_then_recover(
         &store,
         &steps,
-        CrashPoint::AfterSideEffect(Seq::zero().next()),
+        CrashPoint::AfterSideEffect(Seq::zero().next().unwrap()),
     )
     .unwrap();
 

@@ -15,6 +15,8 @@ use crate::execution::WorkflowVersion;
 use crate::failpoints::CrashStatus;
 use crate::failpoints::FailpointPolicy;
 use crate::failpoints::NeverCrash;
+use crate::history::RecoveryHistory;
+use crate::history::ValidatedHistory;
 use crate::journal::EventPayload;
 use crate::journal::Journal;
 use crate::journal::JournalEvent;
@@ -198,7 +200,7 @@ impl<'a, S: JournalStore> Execution<'a, S, Created> {
         })
     }
 
-    /// Validates the recorded invocation before inspecting its terminal outcome.
+    /// Validates the invocation and complete event grammar before recovery.
     ///
     /// # Errors
     /// Reports absent or invalid invocations, mismatched names or versions,
@@ -214,41 +216,37 @@ impl<'a, S: JournalStore> Execution<'a, S, Created> {
         let invocation = Invocation::parse(id, &journal)?;
         invocation.select(current_name, current_version)?;
 
-        if let Some(JournalEvent::ExecutionCompleted { output }) = journal.events().last() {
-            let execution = Execution {
-                store,
-                id,
-                lease,
-                _state: PhantomData,
-            };
-            return Ok(RecoveredExecution::AlreadyCompleted(
-                execution,
-                output.clone(),
-            ));
+        let history = ValidatedHistory::parse(journal)?;
+        match history.into_recovery() {
+            RecoveryHistory::Completed(output) => Ok(RecoveredExecution::AlreadyCompleted(
+                Execution {
+                    store,
+                    id,
+                    lease,
+                    _state: PhantomData,
+                },
+                output,
+            )),
+            RecoveryHistory::Failed(error) => Ok(RecoveredExecution::AlreadyFailed(
+                Execution {
+                    store,
+                    id,
+                    lease,
+                    _state: PhantomData,
+                },
+                error,
+            )),
+            RecoveryHistory::Running(history) => Ok(RecoveredExecution::StillRunning(
+                Execution {
+                    store,
+                    id,
+                    lease,
+                    _state: PhantomData,
+                },
+                ReplayCursor::from_history(history),
+                invocation,
+            )),
         }
-        if let Some(JournalEvent::ExecutionFailed { error }) = journal.events().last() {
-            let execution = Execution {
-                store,
-                id,
-                lease,
-                _state: PhantomData,
-            };
-            return Ok(RecoveredExecution::AlreadyFailed(execution, error.clone()));
-        }
-
-        // `ExecutionStarted` is the execution-level bookmark, not a
-        // per-command event; the replay cursor walks commands only.
-        let remaining: Vec<JournalEvent> = journal.events().iter().skip(1).cloned().collect();
-        let cursor = ReplayCursor::new(Journal::new(remaining));
-        let execution = Execution {
-            store,
-            id,
-            lease,
-            _state: PhantomData,
-        };
-        Ok(RecoveredExecution::StillRunning(
-            execution, cursor, invocation,
-        ))
     }
 }
 
@@ -393,7 +391,8 @@ impl<'a, S: JournalStore> Engine<'a, S> {
     /// Recovers `id` and continues it: replays journaled commands, then
     /// runs any unjournaled remainder live. An execution already terminal
     /// returns its recorded outcome without invoking `workflow.run` again.
-    /// Input is always taken from the validated durable start record.
+    /// Input is always taken from the validated durable start record. The complete
+    /// event grammar is checked before workflow code or terminal retrieval.
     /// Workflow success and failure require consuming all recorded events;
     /// otherwise recovery returns `EngineError::UnconsumedHistory` without
     /// appending a terminal event.

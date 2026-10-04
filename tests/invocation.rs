@@ -13,6 +13,7 @@ use yaoki::execution::ExecutionId;
 use yaoki::execution::WorkflowErrorRecord;
 use yaoki::execution::WorkflowName;
 use yaoki::execution::WorkflowVersion;
+use yaoki::journal::EventOffset;
 use yaoki::journal::EventPayload;
 use yaoki::journal::Journal;
 use yaoki::journal::JournalError;
@@ -536,7 +537,7 @@ impl JournalStore for ObservedJournal {
         self.inner.load(id)
     }
 
-    fn append(&self, id: &ExecutionId, event: JournalEvent) -> Result<Seq, JournalError> {
+    fn append(&self, id: &ExecutionId, event: JournalEvent) -> Result<EventOffset, JournalError> {
         assert_eq!(
             self.inner.acquire(id).err(),
             Some(JournalError::ExecutionOwned { id: *id })

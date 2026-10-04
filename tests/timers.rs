@@ -186,15 +186,15 @@ fn recovery_mid_timer_rearms_the_remainder_and_completes_the_workflow_live() {
             },
             JournalEvent::TimerFired { seq: Seq::zero() },
             JournalEvent::StepScheduled {
-                seq: Seq::zero().next(),
+                seq: Seq::zero().next().unwrap(),
                 name: charge_renewal_name(),
             },
             JournalEvent::StepStarted {
-                seq: Seq::zero().next(),
+                seq: Seq::zero().next().unwrap(),
                 attempt: yaoki::step::Attempt::first(),
             },
             JournalEvent::StepCompleted {
-                seq: Seq::zero().next(),
+                seq: Seq::zero().next().unwrap(),
                 result: charge_renewal_confirmation(),
             },
             JournalEvent::ExecutionCompleted {
