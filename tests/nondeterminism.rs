@@ -12,7 +12,6 @@
 //! even when the live clock on recovery reads a different, post-deadline
 //! instant.
 
-use yaoki::command::CommandKind;
 use yaoki::context::EngineError;
 use yaoki::context::WorkflowCtx;
 use yaoki::engine::Engine;
@@ -235,7 +234,7 @@ impl Workflow<MemoryJournal> for TimeAwareRenewalWorkflow {
 }
 
 #[test]
-fn recovery_branching_on_ambient_time_with_a_different_step_name_is_nondeterminism() {
+fn recovery_branching_on_ambient_time_with_a_different_step_name_rejects_unconsumed_history() {
     let store = MemoryJournal::new();
     let execution = renewal_execution();
     seed_crashed_run_after_charge_renewal(&store, execution);
@@ -245,26 +244,20 @@ fn recovery_branching_on_ambient_time_with_a_different_step_name_is_nondetermini
         ambient_now: after_deadline_timestamp(),
         past_deadline_command: PastDeadlineCommand::DifferentStepName,
     };
+    let before = store.load(&execution).unwrap();
     let unused_clock = TestClock::at(after_deadline_timestamp());
 
     let result = engine.recover_and_run(execution, &workflow, &unused_clock, &mut unused_rng());
 
-    match result {
-        Err(RunError::Workflow(StepError::Engine(EngineError::Nondeterminism {
-            seq,
-            expected,
-            got,
-        }))) => {
-            assert_eq!(seq, Seq::zero());
-            assert_eq!(expected, CommandKind::RunStep);
-            assert_eq!(got, CommandKind::RunStep);
-        }
-        other => panic!("expected Nondeterminism error, got {other:?}"),
-    }
+    assert!(matches!(
+        result,
+        Err(RunError::Engine(EngineError::UnconsumedHistory))
+    ));
+    assert_eq!(store.load(&execution).unwrap(), before);
 }
 
 #[test]
-fn recovery_branching_on_ambient_time_reading_now_instead_of_a_step_is_nondeterminism() {
+fn recovery_branching_on_ambient_time_reading_now_instead_of_a_step_rejects_unconsumed_history() {
     let store = MemoryJournal::new();
     let execution = renewal_execution();
     seed_crashed_run_after_charge_renewal(&store, execution);
@@ -274,22 +267,16 @@ fn recovery_branching_on_ambient_time_reading_now_instead_of_a_step_is_nondeterm
         ambient_now: after_deadline_timestamp(),
         past_deadline_command: PastDeadlineCommand::ReadNowInstead,
     };
+    let before = store.load(&execution).unwrap();
     let unused_clock = TestClock::at(after_deadline_timestamp());
 
     let result = engine.recover_and_run(execution, &workflow, &unused_clock, &mut unused_rng());
 
-    match result {
-        Err(RunError::Workflow(StepError::Engine(EngineError::Nondeterminism {
-            seq,
-            expected,
-            got,
-        }))) => {
-            assert_eq!(seq, Seq::zero());
-            assert_eq!(expected, CommandKind::RunStep);
-            assert_eq!(got, CommandKind::ReadNow);
-        }
-        other => panic!("expected Nondeterminism error, got {other:?}"),
-    }
+    assert!(matches!(
+        result,
+        Err(RunError::Engine(EngineError::UnconsumedHistory))
+    ));
+    assert_eq!(store.load(&execution).unwrap(), before);
 }
 
 #[test]

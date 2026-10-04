@@ -78,6 +78,10 @@ pub enum EngineError {
         got: CommandKind,
     },
 
+    /// Workflow code returned while recorded events remained unread.
+    #[error("workflow returned before consuming the recorded history")]
+    UnconsumedHistory,
+
     #[error("workflow version mismatch: journal {recorded:?}, code {current:?}")]
     VersionMismatch {
         recorded: WorkflowVersion,
@@ -225,6 +229,20 @@ impl<'a, S: JournalStore> WorkflowCtx<'a, S> {
     /// Whether an injected crash fired during this run.
     pub fn crash_status(&self) -> CrashStatus {
         self.crash
+    }
+
+    /// Refuses terminal recording while replay still has unread events.
+    pub(crate) fn ensure_replay_complete(&self) -> Result<(), EngineError> {
+        match &self.mode {
+            Mode::Live => Ok(()),
+            Mode::Replaying(cursor) => {
+                if cursor.is_exhausted() {
+                    Ok(())
+                } else {
+                    Err(EngineError::UnconsumedHistory)
+                }
+            }
+        }
     }
 
     /// Consults the policy at `point`. On `Crash`, records the crash and
@@ -669,6 +687,53 @@ mod tests {
         fn load(&self, _id: &ExecutionId) -> Result<Journal, JournalError> {
             Err(JournalError::Poisoned)
         }
+    }
+
+    #[test]
+    fn ensure_replay_complete_in_live_mode_accepts_terminal_recording() {
+        let store = MemoryJournal::new();
+        let execution = signup_execution();
+        let clock = unused_clock();
+        let mut rng = unused_rng();
+        let ctx = WorkflowCtx::new(
+            &store,
+            execution,
+            ReplayCursor::new(Journal::empty()),
+            &clock,
+            &mut rng,
+        );
+
+        let result = ctx.ensure_replay_complete();
+
+        assert_eq!(result, Ok(()));
+        assert!(store.load(&execution).unwrap().is_empty());
+    }
+
+    #[test]
+    fn ensure_replay_complete_with_unread_events_refuses_without_advancing() {
+        let store = MemoryJournal::new();
+        let execution = signup_execution();
+        let recorded = charge_renewal_deadline();
+        let clock = TestClock::at(Timestamp::from_millis_since_epoch(0));
+        let mut rng = unused_rng();
+        let mut ctx = WorkflowCtx::new(
+            &store,
+            execution,
+            ReplayCursor::new(Journal::new(vec![JournalEvent::NowRecorded {
+                seq: Seq::zero(),
+                value: recorded,
+            }])),
+            &clock,
+            &mut rng,
+        );
+
+        let incomplete = ctx.ensure_replay_complete();
+
+        assert_eq!(incomplete, Err(EngineError::UnconsumedHistory));
+        assert_eq!(ctx.seq, Seq::zero());
+        assert_eq!(ctx.now(), Ok(recorded));
+        assert_eq!(ctx.ensure_replay_complete(), Ok(()));
+        assert!(store.load(&execution).unwrap().is_empty());
     }
 
     #[test]

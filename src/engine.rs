@@ -394,6 +394,9 @@ impl<'a, S: JournalStore> Engine<'a, S> {
     /// runs any unjournaled remainder live. An execution already terminal
     /// returns its recorded outcome without invoking `workflow.run` again.
     /// Input is always taken from the validated durable start record.
+    /// Workflow success and failure require consuming all recorded events;
+    /// otherwise recovery returns `EngineError::UnconsumedHistory` without
+    /// appending a terminal event.
     ///
     /// ```compile_fail
     /// use yaoki::engine::Engine;
@@ -454,6 +457,7 @@ impl<'a, S: JournalStore> Engine<'a, S> {
             }
             CrashStatus::Intact => {}
         }
+        ctx.ensure_replay_complete().map_err(RunError::Engine)?;
 
         match result {
             Ok(output) => {
