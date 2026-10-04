@@ -3,9 +3,11 @@
 //! builds a fresh engine over the same store, recovers, and compares the
 //! effects the steps performed against a failure-free reference run.
 //!
-//! `DuplicateLast` holds for every window. `ExactlyOnce` holds for every
-//! window except `AfterSideEffect`, where the effect outran its journal
-//! record.
+//! Each step records one effect per attempt. With one interruption,
+//! `DuplicateLast` accepts every tested window. Exact trace equality holds
+//! except at `AfterSideEffect`, where the effect outran its journal record.
+//! Multiple interruptions can exceed the single-duplicate allowance. These
+//! traces count body effects, not recipient-side deduplication.
 
 use std::cell::RefCell;
 
@@ -18,6 +20,7 @@ use yaoki::equivalence::DuplicateLast;
 use yaoki::equivalence::EffectTrace;
 use yaoki::equivalence::Equivalence;
 use yaoki::equivalence::ExactlyOnce;
+use yaoki::equivalence::ReplayAll;
 use yaoki::execution::ExecutionId;
 use yaoki::execution::WorkflowName;
 use yaoki::execution::WorkflowVersion;
@@ -372,6 +375,139 @@ fn crash_after_step_completed_replays_the_step_without_rerunning_it() {
     assert_eq!(recovered.effects, reference);
     assert!(ExactlyOnce::equivalent(&recovered.effects, &reference));
     assert_eq!(recovered.output, account_created());
+}
+
+#[test]
+fn exactly_once_engine_after_an_effect_interruption_duplicates_the_memory_store_effect() {
+    let reference = signup_reference_trace();
+    let store = MemoryJournal::new();
+    let effects = RefCell::new(EffectTrace::new());
+    let execution = signup_execution();
+    let point = CrashPoint::AfterSideEffect(Seq::zero());
+    let policy = CrashOnce::new(point);
+
+    let crashed = Engine::<_, ExactlyOnce>::with_failpoints(&store, &policy).run(
+        execution,
+        &SignupWorkflow { effects: &effects },
+        signup_input(),
+        &signup_clock(),
+        &mut unused_rng(),
+    );
+    assert!(matches!(
+        crashed,
+        Err(RunError::Engine(EngineError::InjectedCrash(actual))) if actual == point
+    ));
+    let output = Engine::<_, ExactlyOnce>::new(&store)
+        .recover_and_run(
+            execution,
+            &SignupWorkflow { effects: &effects },
+            signup_input(),
+            &signup_clock(),
+            &mut unused_rng(),
+        )
+        .unwrap();
+
+    let observed = effects.into_inner();
+    let mut expected = EffectTrace::new();
+    expected.record(charge_card(), charge_confirmation());
+    expected.record(charge_card(), charge_confirmation());
+    expected.record(create_account(), account_created());
+    assert_eq!(observed, expected);
+    assert_eq!(output, account_created());
+    assert!(!ExactlyOnce::equivalent(&observed, &reference));
+    assert!(DuplicateLast::equivalent(&observed, &reference));
+    assert_eq!(
+        count_events(store.load(&execution).unwrap().events(), &charge_card()),
+        1
+    );
+}
+
+#[test]
+fn recovery_after_two_effect_interruptions_exceeds_the_single_duplicate_allowance() {
+    let reference = signup_reference_trace();
+    let store = MemoryJournal::new();
+    let effects = RefCell::new(EffectTrace::new());
+    let execution = signup_execution();
+    let point = CrashPoint::AfterSideEffect(Seq::zero());
+    let first_policy = CrashOnce::new(point);
+    let second_policy = CrashOnce::new(point);
+
+    let first = Engine::<_, DuplicateLast>::with_failpoints(&store, &first_policy).run(
+        execution,
+        &SignupWorkflow { effects: &effects },
+        signup_input(),
+        &signup_clock(),
+        &mut unused_rng(),
+    );
+    let second = Engine::<_, DuplicateLast>::with_failpoints(&store, &second_policy)
+        .recover_and_run(
+            execution,
+            &SignupWorkflow { effects: &effects },
+            signup_input(),
+            &signup_clock(),
+            &mut unused_rng(),
+        );
+    let output = Engine::<_, DuplicateLast>::new(&store)
+        .recover_and_run(
+            execution,
+            &SignupWorkflow { effects: &effects },
+            signup_input(),
+            &signup_clock(),
+            &mut unused_rng(),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        first,
+        Err(RunError::Engine(EngineError::InjectedCrash(actual))) if actual == point
+    ));
+    assert!(matches!(
+        second,
+        Err(RunError::Engine(EngineError::InjectedCrash(actual))) if actual == point
+    ));
+    let observed = effects.into_inner();
+    let mut expected = EffectTrace::new();
+    expected.record(charge_card(), charge_confirmation());
+    expected.record(charge_card(), charge_confirmation());
+    expected.record(charge_card(), charge_confirmation());
+    expected.record(create_account(), account_created());
+    assert_eq!(observed, expected);
+    assert_eq!(output, account_created());
+    assert!(!DuplicateLast::equivalent(&observed, &reference));
+    assert!(!ExactlyOnce::equivalent(&observed, &reference));
+    assert_eq!(
+        count_events(store.load(&execution).unwrap().events(), &charge_card()),
+        1
+    );
+    let journal = store.load(&execution).unwrap();
+    let attempts = journal
+        .events()
+        .iter()
+        .filter(
+            |event| matches!(event, JournalEvent::StepStarted { seq, .. } if *seq == Seq::zero()),
+        )
+        .count();
+    assert_eq!(attempts, 3);
+}
+
+#[test]
+fn exactly_once_predicate_with_repeated_equal_records_accepts_exact_trace_equality() {
+    let mut reference = EffectTrace::new();
+    reference.record(charge_card(), charge_confirmation());
+    reference.record(charge_card(), charge_confirmation());
+    let observed = reference.clone();
+
+    assert!(ExactlyOnce::equivalent(&observed, &reference));
+}
+
+#[test]
+fn replay_all_predicate_with_repeated_equal_records_rejects_exact_trace_equality() {
+    let mut reference = EffectTrace::new();
+    reference.record(charge_card(), charge_confirmation());
+    reference.record(charge_card(), charge_confirmation());
+    let observed = reference.clone();
+
+    assert!(!ReplayAll::equivalent(&observed, &reference));
 }
 
 #[test]
