@@ -16,7 +16,6 @@ use std::error::Error;
 use yaoki::context::WorkflowCtx;
 use yaoki::engine::Engine;
 use yaoki::engine::Workflow;
-use yaoki::equivalence::DuplicateLast;
 use yaoki::execution::ExecutionId;
 use yaoki::execution::WorkflowName;
 use yaoki::execution::WorkflowVersion;
@@ -181,7 +180,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // create-account is even scheduled.
     println!("run 1: charge the card, then die");
     let policy = CrashOnce::new(CrashPoint::AfterStepCompleted(Seq::zero()));
-    let crashed = Engine::<_, DuplicateLast>::with_failpoints(&store, &policy).run(
+    let crashed = Engine::<_>::with_failpoints(&store, &policy).run(
         execution,
         &workflow,
         signup_input(),
@@ -194,7 +193,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // A fresh engine over the surviving journal: charge-payment is answered
     // from the journal, only create-account runs.
     println!("run 2: recover over the same journal");
-    let output = Engine::<_, DuplicateLast>::new(&store).recover_and_run(
+    let output = Engine::<_>::new(&store).recover_and_run(
         execution,
         &workflow,
         signup_input(),

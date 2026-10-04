@@ -172,7 +172,7 @@ impl Workflow<MemoryJournal> for TrialSignupWorkflow<'_> {
 fn signup_reference_trace() -> EffectTrace {
     let store = MemoryJournal::new();
     let effects = RefCell::new(EffectTrace::new());
-    let engine = Engine::<_, DuplicateLast>::new(&store);
+    let engine = Engine::<_>::new(&store);
     engine
         .run(
             signup_execution(),
@@ -188,7 +188,7 @@ fn signup_reference_trace() -> EffectTrace {
 fn trial_reference_trace() -> EffectTrace {
     let store = MemoryJournal::new();
     let effects = RefCell::new(EffectTrace::new());
-    let engine = Engine::<_, DuplicateLast>::new(&store);
+    let engine = Engine::<_>::new(&store);
     engine
         .run(
             signup_execution(),
@@ -218,7 +218,7 @@ fn crash_then_recover(point: CrashPoint) -> Recovered {
     let execution = signup_execution();
     let policy = CrashOnce::new(point);
 
-    let crashed = Engine::<_, DuplicateLast>::with_failpoints(&store, &policy).run(
+    let crashed = Engine::<_>::with_failpoints(&store, &policy).run(
         execution,
         &SignupWorkflow { effects: &effects },
         signup_input(),
@@ -234,7 +234,7 @@ fn crash_then_recover(point: CrashPoint) -> Recovered {
     );
     assert!(policy.has_fired());
 
-    let output = Engine::<_, DuplicateLast>::new(&store)
+    let output = Engine::<_>::new(&store)
         .recover_and_run(
             execution,
             &SignupWorkflow { effects: &effects },
@@ -258,7 +258,7 @@ fn crash_then_recover_trial(point: CrashPoint) -> Recovered {
     let execution = signup_execution();
     let policy = CrashOnce::new(point);
 
-    let crashed = Engine::<_, DuplicateLast>::with_failpoints(&store, &policy).run(
+    let crashed = Engine::<_>::with_failpoints(&store, &policy).run(
         execution,
         &TrialSignupWorkflow { effects: &effects },
         signup_input(),
@@ -273,7 +273,7 @@ fn crash_then_recover_trial(point: CrashPoint) -> Recovered {
         "expected InjectedCrash({point:?}), got {crashed:?}"
     );
 
-    let output = Engine::<_, DuplicateLast>::new(&store)
+    let output = Engine::<_>::new(&store)
         .recover_and_run(
             execution,
             &TrialSignupWorkflow { effects: &effects },
@@ -378,7 +378,7 @@ fn crash_after_step_completed_replays_the_step_without_rerunning_it() {
 }
 
 #[test]
-fn exactly_once_engine_after_an_effect_interruption_duplicates_the_memory_store_effect() {
+fn memory_engine_after_an_effect_interruption_duplicates_the_effect() {
     let reference = signup_reference_trace();
     let store = MemoryJournal::new();
     let effects = RefCell::new(EffectTrace::new());
@@ -386,7 +386,7 @@ fn exactly_once_engine_after_an_effect_interruption_duplicates_the_memory_store_
     let point = CrashPoint::AfterSideEffect(Seq::zero());
     let policy = CrashOnce::new(point);
 
-    let crashed = Engine::<_, ExactlyOnce>::with_failpoints(&store, &policy).run(
+    let crashed = Engine::<_>::with_failpoints(&store, &policy).run(
         execution,
         &SignupWorkflow { effects: &effects },
         signup_input(),
@@ -397,7 +397,7 @@ fn exactly_once_engine_after_an_effect_interruption_duplicates_the_memory_store_
         crashed,
         Err(RunError::Engine(EngineError::InjectedCrash(actual))) if actual == point
     ));
-    let output = Engine::<_, ExactlyOnce>::new(&store)
+    let output = Engine::<_>::new(&store)
         .recover_and_run(
             execution,
             &SignupWorkflow { effects: &effects },
@@ -432,22 +432,21 @@ fn recovery_after_two_effect_interruptions_exceeds_the_single_duplicate_allowanc
     let first_policy = CrashOnce::new(point);
     let second_policy = CrashOnce::new(point);
 
-    let first = Engine::<_, DuplicateLast>::with_failpoints(&store, &first_policy).run(
+    let first = Engine::<_>::with_failpoints(&store, &first_policy).run(
         execution,
         &SignupWorkflow { effects: &effects },
         signup_input(),
         &signup_clock(),
         &mut unused_rng(),
     );
-    let second = Engine::<_, DuplicateLast>::with_failpoints(&store, &second_policy)
-        .recover_and_run(
-            execution,
-            &SignupWorkflow { effects: &effects },
-            signup_input(),
-            &signup_clock(),
-            &mut unused_rng(),
-        );
-    let output = Engine::<_, DuplicateLast>::new(&store)
+    let second = Engine::<_>::with_failpoints(&store, &second_policy).recover_and_run(
+        execution,
+        &SignupWorkflow { effects: &effects },
+        signup_input(),
+        &signup_clock(),
+        &mut unused_rng(),
+    );
+    let output = Engine::<_>::new(&store)
         .recover_and_run(
             execution,
             &SignupWorkflow { effects: &effects },
@@ -565,7 +564,7 @@ fn a_crashed_run_journals_no_terminal_event() {
     let execution = signup_execution();
     let policy = CrashOnce::new(CrashPoint::AfterSideEffect(Seq::zero()));
 
-    let crashed = Engine::<_, DuplicateLast>::with_failpoints(&store, &policy).run(
+    let crashed = Engine::<_>::with_failpoints(&store, &policy).run(
         execution,
         &SignupWorkflow { effects: &effects },
         signup_input(),
@@ -597,7 +596,7 @@ fn two_crashes_in_the_same_step_accumulate_attempts_and_still_recover() {
 
     // First crash: after StepStarted, before the charge.
     let first_policy = CrashOnce::new(CrashPoint::AfterStepStarted(Seq::zero()));
-    let _first = Engine::<_, DuplicateLast>::with_failpoints(&store, &first_policy).run(
+    let _first = Engine::<_>::with_failpoints(&store, &first_policy).run(
         execution,
         &SignupWorkflow { effects: &effects },
         signup_input(),
@@ -606,16 +605,15 @@ fn two_crashes_in_the_same_step_accumulate_attempts_and_still_recover() {
     );
     // Second crash: same window, on the recovery attempt.
     let second_policy = CrashOnce::new(CrashPoint::AfterStepStarted(Seq::zero()));
-    let _second = Engine::<_, DuplicateLast>::with_failpoints(&store, &second_policy)
-        .recover_and_run(
-            execution,
-            &SignupWorkflow { effects: &effects },
-            signup_input(),
-            &signup_clock(),
-            &mut unused_rng(),
-        );
+    let _second = Engine::<_>::with_failpoints(&store, &second_policy).recover_and_run(
+        execution,
+        &SignupWorkflow { effects: &effects },
+        signup_input(),
+        &signup_clock(),
+        &mut unused_rng(),
+    );
 
-    let output = Engine::<_, DuplicateLast>::new(&store)
+    let output = Engine::<_>::new(&store)
         .recover_and_run(
             execution,
             &SignupWorkflow { effects: &effects },

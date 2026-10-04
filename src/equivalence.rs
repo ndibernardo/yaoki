@@ -1,18 +1,10 @@
-//! Recovery equivalence contracts. The sealed `Equivalence` trait and its
-//! three modes (`ExactlyOnce`, `DuplicateLast`, `ReplayAll`) describe how far
-//! an observed effect trace may diverge from a failure-free reference trace
-//! after a crash and recovery. `TransactionalBoundary` gates which modes a
-//! given `JournalStore` supports.
+//! Experimental comparisons of recorded effect traces with a reference.
+//! These predicates do not select engine behavior, enforce transactions,
+//! or prove recipient-side guarantees. Records identify effects by name
+//! and payload, so separate logical operations can be indistinguishable.
 
 use crate::journal::EventPayload;
-use crate::journal::JournalStore;
 use crate::step::StepName;
-
-/// Marker for a `JournalStore` whose journal append and side effects commit
-/// atomically. `MemoryJournal` qualifies trivially (one process, one
-/// memory); a `FileJournal` writing to disk while a step calls out over the
-/// network does not.
-pub trait TransactionalBoundary {}
 
 /// One step's recorded external effect: its name and the payload it
 /// produced. This is what `Equivalence::equivalent` compares. It is
@@ -25,6 +17,7 @@ pub struct EffectRecord {
 }
 
 impl EffectRecord {
+    /// Records an observed effect's step name and result payload.
     pub fn new(step: StepName, payload: EventPayload) -> Self {
         Self { step, payload }
     }
@@ -38,14 +31,17 @@ impl EffectRecord {
 pub struct EffectTrace(Vec<EffectRecord>);
 
 impl EffectTrace {
+    /// Creates an empty observation trace.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Appends an observation without deduplicating equal records.
     pub fn record(&mut self, step: StepName, payload: EventPayload) {
         self.0.push(EffectRecord::new(step, payload));
     }
 
+    /// Borrows all observations in their recorded order.
     pub fn records(&self) -> &[EffectRecord] {
         &self.0
     }
@@ -55,37 +51,32 @@ mod sealed {
     pub trait Sealed {}
 }
 
-/// The comparison a recovery mechanism promises to satisfy. Sealed: exactly
-/// three implementations, below.
+/// Sealed experimental trace predicates, not runtime recovery contracts.
+/// The comparisons are directional and need not be equivalence relations.
 pub trait Equivalence: sealed::Sealed {
+    /// Applies this predicate's observation rules to the supplied traces.
     fn equivalent(observed: &EffectTrace, reference: &EffectTrace) -> bool;
 }
 
-/// Whether store `S` supports equivalence mode `E`. `DuplicateLast` and
-/// `ReplayAll` accept any `JournalStore`; `ExactlyOnce` additionally
-/// requires `TransactionalBoundary`. Without atomic append-plus-effect, a
-/// crash between a side effect landing and its journal record can duplicate
-/// the effect, and no comparison function can undo that after the fact.
-pub trait SupportedOn<S: JournalStore>: Equivalence {}
-
-/// Every effect happens exactly once: identity over effect traces. Usable
-/// only on a `TransactionalBoundary` store; see `SupportedOn`.
+/// Exact equality of ordered records, including repeated equal values.
+/// Only supplied observations are compared; unrecorded effects and external
+/// atomicity are outside this predicate's domain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExactlyOnce;
 
-/// Recovery may duplicate at most one effect: the last one performed before
-/// the crash. The window is between a side effect landing and its
-/// `StepCompleted` becoming durable. Recovery cannot tell the effect
-/// happened, so it reruns the step and the effect lands a second time
-/// directly after the first. `Last` means last at the moment of the crash,
-/// not last in the trace: a crash on a middle step duplicates that step's
-/// effect in place, and the remaining steps still follow.
+/// Equality or exactly one extra adjacent copy of a reference record.
+/// With one effect per step and one interruption after an effect but before
+/// its completion record, the interrupted effect can repeat at any position.
+/// Multiple interruptions and multi-effect bodies can exceed this allowance.
+/// The predicate neither prevents duplicates nor checks recipient idempotence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DuplicateLast;
 
-/// Recovery may re-run the whole workflow from scratch, legal only when
-/// every step's effect is idempotent. `observed`, with repeated effects
-/// collapsed to their first occurrence, must equal `reference`.
+/// Equality after retaining only the first occurrence of each observed record.
+/// Reference records must be pairwise distinct for identical traces to pass.
+/// Separate equal logical operations are indistinguishable in this model.
+/// First appearances must follow reference order; duplicates can occur anywhere.
+/// This neither checks recipient idempotence nor triggers a workflow restart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReplayAll;
 
@@ -133,36 +124,16 @@ impl Equivalence for ReplayAll {
     }
 }
 
-impl<S: JournalStore + TransactionalBoundary> SupportedOn<S> for ExactlyOnce {}
-impl<S: JournalStore> SupportedOn<S> for DuplicateLast {}
-impl<S: JournalStore> SupportedOn<S> for ReplayAll {}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::execution::ExecutionId;
-    use crate::journal::Journal;
-    use crate::journal::JournalError;
-
-    /// Never used as a real store. It only stands in for a generic `S` in
-    /// `SupportedOn` bound checks below.
-    struct StubStore;
-
-    impl JournalStore for StubStore {
-        fn append(
-            &self,
-            _id: &ExecutionId,
-            _event: crate::journal::JournalEvent,
-        ) -> Result<crate::journal::Seq, JournalError> {
-            Err(JournalError::Poisoned)
-        }
-
-        fn load(&self, _id: &ExecutionId) -> Result<Journal, JournalError> {
-            Err(JournalError::Poisoned)
-        }
-    }
-
-    impl TransactionalBoundary for StubStore {}
+    use super::DuplicateLast;
+    use super::EffectRecord;
+    use super::EffectTrace;
+    use super::Equivalence;
+    use super::ExactlyOnce;
+    use super::ReplayAll;
+    use crate::journal::EventPayload;
+    use crate::step::StepName;
 
     fn charge_renewal() -> StepName {
         StepName::new("charge-renewal").unwrap()
@@ -365,18 +336,5 @@ mod tests {
         let observed = EffectTrace::new();
 
         assert!(ReplayAll::equivalent(&observed, &reference));
-    }
-
-    #[test]
-    fn memory_journal_supports_exactly_once() {
-        fn assert_supported<S: JournalStore, E: SupportedOn<S>>() {}
-        assert_supported::<crate::stores::memory::MemoryJournal, ExactlyOnce>();
-    }
-
-    #[test]
-    fn any_journal_store_supports_duplicate_last_and_replay_all() {
-        fn assert_supported<S: JournalStore, E: SupportedOn<S>>() {}
-        assert_supported::<StubStore, DuplicateLast>();
-        assert_supported::<StubStore, ReplayAll>();
     }
 }

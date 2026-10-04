@@ -1,7 +1,7 @@
-//! Property tests for the recovery-equivalence ladder. Workflows of one to
-//! eight steps are generated, crashed at a random window of a random step,
-//! and recovered over the same store. Each property pins one rung of the
-//! ladder: what the mode promises, and what it refuses to promise.
+//! Experimental trace checks for workflows with one effect per step.
+//! Generated workflows have one to eight distinct step names and one
+//! interruption. The predicates compare observations; they do not select
+//! engine behavior or establish recipient-side guarantees.
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -147,9 +147,8 @@ impl<S: JournalStore> Workflow<S> for GeneratedWorkflow<'_> {
     }
 }
 
-/// External system that applies an effect at most once per idempotency key,
-/// the way a payment API deduplicates a retried charge. `ReplayAll` is only
-/// legal for step bodies that end in a sink like this one.
+/// In-memory recipient that applies each idempotency key once while it survives.
+/// The effect trace separately counts every attempt, including deduplicated ones.
 struct IdempotentSink {
     applied: RefCell<HashSet<IdempotencyKey>>,
 }
@@ -217,7 +216,7 @@ struct Reference {
 fn reference_run(steps: &[StepName]) -> Reference {
     let store = MemoryJournal::new();
     let effects = RefCell::new(EffectTrace::new());
-    let output = Engine::<_, DuplicateLast>::new(&store)
+    let output = Engine::<_>::new(&store)
         .run(
             onboarding_execution(),
             &GeneratedWorkflow {
@@ -247,7 +246,7 @@ fn crash_then_recover<S: JournalStore>(
     let execution = onboarding_execution();
     let policy = CrashOnce::new(point);
 
-    let crashed = Engine::<_, DuplicateLast>::with_failpoints(store, &policy).run(
+    let crashed = Engine::<_>::with_failpoints(store, &policy).run(
         execution,
         &GeneratedWorkflow {
             steps: steps.to_vec(),
@@ -265,7 +264,7 @@ fn crash_then_recover<S: JournalStore>(
         "expected InjectedCrash({point:?}), got {crashed:?}"
     );
 
-    let output = Engine::<_, DuplicateLast>::new(store)
+    let output = Engine::<_>::new(store)
         .recover_and_run(
             execution,
             &GeneratedWorkflow {
@@ -386,8 +385,7 @@ proptest! {
     fn replay_all_holds_when_recovery_reruns_the_whole_workflow(
         steps in workflow_steps()
     ) {
-        // No journal survives between the two runs, so the second engine
-        // replays nothing and re-executes every step: the ReplayAll rung.
+        // Separate empty journals cause full re-execution, not a predicate.
         let reference = reference_run(&steps);
         let effects = RefCell::new(EffectTrace::new());
         let sink = IdempotentSink::new();
@@ -395,7 +393,7 @@ proptest! {
         let second_store = MemoryJournal::new();
 
         for store in [&first_store, &second_store] {
-            Engine::<_, ReplayAll>::new(store)
+            Engine::<_>::new(store)
                 .run(
                     onboarding_execution(),
                     &IdempotentWorkflow {
@@ -432,7 +430,7 @@ proptest! {
         let second_store = MemoryJournal::new();
 
         for store in [&first_store, &second_store] {
-            Engine::<_, ReplayAll>::new(store)
+            Engine::<_>::new(store)
                 .run(
                     onboarding_execution(),
                     &IdempotentWorkflow {
@@ -447,7 +445,7 @@ proptest! {
                 .unwrap();
         }
 
-        // The ladder is strict: a full rerun is more than one duplicate.
+        // A full rerun of at least two steps exceeds one extra effect.
         let observed = effects.into_inner();
         prop_assert!(ReplayAll::equivalent(&observed, &reference.effects));
         prop_assert!(!DuplicateLast::equivalent(&observed, &reference.effects));
@@ -460,7 +458,7 @@ proptest! {
         let store = MemoryJournal::new();
         let execution = onboarding_execution();
         let first_effects = RefCell::new(EffectTrace::new());
-        let first_output = Engine::<_, DuplicateLast>::new(&store)
+        let first_output = Engine::<_>::new(&store)
             .run(
                 execution,
                 &GeneratedWorkflow { steps: steps.clone(), effects: &first_effects },
@@ -475,7 +473,7 @@ proptest! {
         let replay_effects = RefCell::new(EffectTrace::new());
         let outputs: Vec<EventPayload> = (0..2)
             .map(|_| {
-                Engine::<_, DuplicateLast>::new(&store)
+                Engine::<_>::new(&store)
                     .recover_and_run(
                         execution,
                         &GeneratedWorkflow {
@@ -510,9 +508,8 @@ proptest! {
     fn exactly_once_fails_after_a_side_effect_crash_on_a_non_transactional_store(
         (steps, point) in steps_and_side_effect_crash()
     ) {
-        // FileJournal is not a TransactionalBoundary: the effect and its
-        // journal record commit separately, so this window duplicates the
-        // effect and no comparison can undo it afterwards.
+        // The body effect and the file append commit separately, so this
+        // interruption duplicates the effect before its result is durable.
         let reference = reference_run(&steps);
         let scratch = ScratchDir::new();
         let store = FileJournal::new(&scratch.path).unwrap();

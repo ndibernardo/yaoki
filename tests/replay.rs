@@ -11,7 +11,6 @@ use std::cell::RefCell;
 use yaoki::context::WorkflowCtx;
 use yaoki::engine::Engine;
 use yaoki::engine::Workflow;
-use yaoki::equivalence::DuplicateLast;
 use yaoki::execution::ExecutionId;
 use yaoki::execution::WorkflowName;
 use yaoki::execution::WorkflowVersion;
@@ -139,7 +138,7 @@ impl Workflow<MemoryJournal> for SignupWorkflow<'_> {
 /// returns the output alongside the steps that really executed.
 fn run_fresh_engine(store: &MemoryJournal, recover: bool) -> (EventPayload, Vec<StepName>) {
     let executed = ExecutionLog::new();
-    let engine = Engine::<_, DuplicateLast>::new(store);
+    let engine = Engine::<_>::new(store);
     let workflow = SignupWorkflow {
         executed: &executed,
     };
@@ -218,7 +217,7 @@ fn a_fresh_engine_over_a_partial_journal_replays_the_prefix_and_runs_the_rest_li
     let store = MemoryJournal::new();
     let interrupted = ExecutionLog::new();
     let policy = CrashOnce::new(CrashPoint::AfterStepCompleted(Seq::zero()));
-    let crashed = Engine::<_, DuplicateLast>::with_failpoints(&store, &policy).run(
+    let crashed = Engine::<_>::with_failpoints(&store, &policy).run(
         signup_execution(),
         &SignupWorkflow {
             executed: &interrupted,

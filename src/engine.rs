@@ -8,7 +8,6 @@ use std::marker::PhantomData;
 use crate::context::EngineError;
 use crate::context::ReplayCursor;
 use crate::context::WorkflowCtx;
-use crate::equivalence::SupportedOn;
 use crate::execution::ExecutionId;
 use crate::execution::WorkflowErrorRecord;
 use crate::execution::WorkflowName;
@@ -200,22 +199,36 @@ pub enum RunError<E> {
     Recovered(WorkflowErrorRecord),
 }
 
-/// Runs workflows against a `JournalStore`, live or recovered, under
-/// recovery-equivalence mode `E`. Borrows the store rather than owning it,
-/// so "wipe the engine, keep the store" is just: drop this `Engine`, build a
-/// fresh one over the same store binding.
+/// Runs workflows live or recovers them over a borrowed journal store.
+/// Effects without a journaled result can repeat. Trace predicates neither
+/// select recovery behavior nor enforce external-effect guarantees.
 ///
-/// `E` is a compile-time contract, not yet a runtime behavior switch:
-/// `Engine::<FileJournal, ExactlyOnce>::new(..)` fails to compile because
-/// `FileJournal` is not a `TransactionalBoundary`. The API teaches the
-/// impossibility before any workflow runs.
-pub struct Engine<'a, S: JournalStore, E: SupportedOn<S>> {
+/// Observation predicates cannot be engine type parameters on either store.
+///
+/// ```compile_fail
+/// use yaoki::engine::Engine;
+/// use yaoki::equivalence::DuplicateLast;
+/// use yaoki::stores::memory::MemoryJournal;
+///
+/// let store = MemoryJournal::new();
+/// let _engine = Engine::<MemoryJournal, DuplicateLast>::new(&store);
+/// ```
+///
+/// ```compile_fail
+/// use yaoki::engine::Engine;
+/// use yaoki::equivalence::DuplicateLast;
+/// use yaoki::stores::file::FileJournal;
+///
+/// fn construct(store: &FileJournal) {
+///     let _engine = Engine::<FileJournal, DuplicateLast>::new(store);
+/// }
+/// ```
+pub struct Engine<'a, S: JournalStore> {
     store: &'a S,
     failpoints: &'a dyn FailpointPolicy,
-    _mode: PhantomData<E>,
 }
 
-impl<'a, S: JournalStore, E: SupportedOn<S>> Engine<'a, S, E> {
+impl<'a, S: JournalStore> Engine<'a, S> {
     /// An engine that never simulates its own death.
     pub fn new(store: &'a S) -> Self {
         Self::with_failpoints(store, &NeverCrash)
@@ -227,11 +240,7 @@ impl<'a, S: JournalStore, E: SupportedOn<S>> Engine<'a, S, E> {
     /// recovering over the same store sees exactly what a killed process
     /// would have left behind.
     pub fn with_failpoints(store: &'a S, failpoints: &'a dyn FailpointPolicy) -> Self {
-        Self {
-            store,
-            failpoints,
-            _mode: PhantomData,
-        }
+        Self { store, failpoints }
     }
 
     pub fn store(&self) -> &'a S {
@@ -326,7 +335,6 @@ impl<'a, S: JournalStore, E: SupportedOn<S>> Engine<'a, S, E> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::equivalence::DuplicateLast;
     use crate::random::RandomBytes;
     use crate::random::RngSource;
     use crate::step::StepErrorRecord;
@@ -602,7 +610,7 @@ mod tests {
     #[test]
     fn engine_run_starts_and_completes_a_fresh_execution() {
         let store = MemoryJournal::new();
-        let engine = Engine::<_, DuplicateLast>::new(&store);
+        let engine = Engine::<_>::new(&store);
         let execution = signup_execution();
 
         let output = engine
@@ -631,7 +639,7 @@ mod tests {
     #[test]
     fn engine_run_fails_and_journals_execution_failed_when_the_workflow_errs() {
         let store = MemoryJournal::new();
-        let engine = Engine::<_, DuplicateLast>::new(&store);
+        let engine = Engine::<_>::new(&store);
         let execution = signup_execution();
 
         let result = engine.run(
@@ -657,7 +665,7 @@ mod tests {
         let store = MemoryJournal::new();
         let execution = signup_execution();
         let first_output = {
-            let engine = Engine::<_, DuplicateLast>::new(&store);
+            let engine = Engine::<_>::new(&store);
             engine
                 .run(
                     execution,
@@ -673,7 +681,7 @@ mod tests {
         // "wipe the engine, keep the store". The first `engine` value
         // above is already gone (dropped at the end of its block); build a
         // fresh `Engine` over the same `store` binding and recover.
-        let recovered_engine = Engine::<_, DuplicateLast>::new(&store);
+        let recovered_engine = Engine::<_>::new(&store);
         let second_output = recovered_engine
             .recover_and_run(
                 execution,
@@ -731,7 +739,7 @@ mod tests {
             )
             .unwrap();
 
-        let engine = Engine::<_, DuplicateLast>::new(&store);
+        let engine = Engine::<_>::new(&store);
         let output = engine
             .recover_and_run(
                 execution,

@@ -1,11 +1,10 @@
-//! In-memory `JournalStore`. Journal append and side effects share one
-//! process's memory, so they commit atomically: this store is a
-//! `TransactionalBoundary`.
+//! In-memory journal storage. Each append locks the journal map; step
+//! effects run separately and are not atomic with their completion records.
+//! Journal contents do not survive process termination.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use crate::equivalence::TransactionalBoundary;
 use crate::execution::ExecutionId;
 use crate::journal::Journal;
 use crate::journal::JournalError;
@@ -41,8 +40,6 @@ impl JournalStore for MemoryJournal {
         Ok(Journal::new(events))
     }
 }
-
-impl TransactionalBoundary for MemoryJournal {}
 
 #[cfg(test)]
 mod tests {

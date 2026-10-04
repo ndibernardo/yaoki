@@ -302,8 +302,8 @@ fn io_error(source: io::Error) -> JournalError {
 }
 
 /// One append-only file per execution: `<dir>/<execution-id-hex>.journal`.
-/// `MemoryJournal`'s append+effect atomicity does not hold across a process
-/// boundary, so this store does not implement `TransactionalBoundary`.
+/// Appends sync the journal file, not the external effects of a step body.
+/// An effect can complete before its result is journaled and repeat on recovery.
 pub struct FileJournal {
     dir: PathBuf,
 }

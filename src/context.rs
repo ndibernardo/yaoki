@@ -124,8 +124,9 @@ enum ReplayedStep {
     Recorded(Result<EventPayload, StepError>),
     /// The journal ends inside this step: the process died before any
     /// outcome was recorded, either before or after the side effect landed.
-    /// The engine cannot tell which, so it reruns as `attempt`;
-    /// `DuplicateLast`/idempotency keys absorb a duplicate effect.
+    /// The engine cannot tell which, so it reruns as `attempt`.
+    /// The stable idempotency key only prevents duplicate effects when
+    /// the recipient enforces deduplication.
     Rerun { attempt: Attempt },
 }
 
@@ -393,8 +394,10 @@ impl<'a, S: JournalStore> WorkflowCtx<'a, S> {
         }
     }
 
-    /// Runs (or replays) a step. `f` receives an `IdempotencyKey` and may do
-    /// arbitrary I/O; it is the unit of atomicity and recovery.
+    /// Replays a recorded step result or runs `f` with a stable idempotency key.
+    /// The step is a replay and recovery boundary, not an atomic transaction.
+    /// Body effects can partially execute or finish before their result is
+    /// journaled and can repeat on recovery.
     pub fn step<F>(&mut self, name: StepName, f: F) -> Result<EventPayload, StepError>
     where
         F: FnOnce(IdempotencyKey) -> Result<EventPayload, StepErrorRecord>,
