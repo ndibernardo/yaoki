@@ -1,32 +1,41 @@
-//! Experimental comparisons of recorded effect traces with a reference.
-//! These predicates do not select engine behavior, enforce transactions,
-//! or prove recipient-side guarantees. Records identify effects by name
-//! and payload, so separate logical operations can be indistinguishable.
+//! Experimental comparisons of recorded observations with a reference.
+//! Operation keys distinguish logical steps from repeated attempts. These
+//! predicates neither control recovery nor prove recipient-side guarantees.
+
+use std::collections::HashMap;
 
 use crate::journal::EventPayload;
+use crate::step::IdempotencyKey;
 use crate::step::StepName;
 
-/// One step's recorded external effect: its name and the payload it
-/// produced. This is what `Equivalence::equivalent` compares. It is
-/// distinct from `JournalEvent`, which is the durability record, not the
-/// effect itself.
+/// One observed step effect, identified by its stable operation key.
+/// A trace models one effect per step attempt, not every possible body effect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectRecord {
+    operation: IdempotencyKey,
     step: StepName,
     payload: EventPayload,
 }
 
 impl EffectRecord {
-    /// Records an observed effect's step name and result payload.
-    pub fn new(step: StepName, payload: EventPayload) -> Self {
-        Self { step, payload }
+    /// Records an operation key, step name, and observed result payload.
+    pub fn new(operation: IdempotencyKey, step: StepName, payload: EventPayload) -> Self {
+        Self {
+            operation,
+            step,
+            payload,
+        }
+    }
+
+    /// Returns the key shared by attempts of this logical operation.
+    pub fn operation(&self) -> IdempotencyKey {
+        self.operation
     }
 }
 
-/// Ordered log of effects a workflow run produced. Step bodies append to a
-/// shared trace as they run; comparing a reference trace (failure-free run)
-/// against an observed one (after a crash and recovery) is what
-/// `Equivalence::equivalent` does.
+/// Ordered observations, including repeated attempts of the same operation.
+/// Keys are supplied by the observer; they do not authenticate an effect or
+/// establish that a recipient applied it.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct EffectTrace(Vec<EffectRecord>);
 
@@ -36,9 +45,24 @@ impl EffectTrace {
         Self::default()
     }
 
-    /// Appends an observation without deduplicating equal records.
-    pub fn record(&mut self, step: StepName, payload: EventPayload) {
-        self.0.push(EffectRecord::new(step, payload));
+    /// Appends an observation without deduplication.
+    /// Retries use the same key; distinct logical steps use distinct keys.
+    ///
+    /// Recording only a name and payload cannot distinguish logical operations.
+    ///
+    /// ```compile_fail
+    /// use yaoki::equivalence::EffectTrace;
+    /// use yaoki::journal::EventPayload;
+    /// use yaoki::step::StepName;
+    ///
+    /// let mut trace = EffectTrace::new();
+    /// trace.record(
+    ///     StepName::new("charge-renewal").unwrap(),
+    ///     EventPayload::new(b"charged".to_vec()),
+    /// );
+    /// ```
+    pub fn record(&mut self, operation: IdempotencyKey, step: StepName, payload: EventPayload) {
+        self.0.push(EffectRecord::new(operation, step, payload));
     }
 
     /// Borrows all observations in their recorded order.
@@ -51,55 +75,55 @@ mod sealed {
     pub trait Sealed {}
 }
 
-/// Sealed experimental trace predicates, not runtime recovery contracts.
+/// Sealed observation predicates, not runtime recovery contracts.
 /// The comparisons are directional and need not be equivalence relations.
-pub trait Equivalence: sealed::Sealed {
-    /// Applies this predicate's observation rules to the supplied traces.
-    fn equivalent(observed: &EffectTrace, reference: &EffectTrace) -> bool;
+pub trait TracePredicate: sealed::Sealed {
+    /// Checks the observed trace against this predicate's reference contract.
+    fn matches(observed: &EffectTrace, reference: &EffectTrace) -> bool;
 }
 
-/// Exact equality of ordered records, including repeated equal values.
-/// Only supplied observations are compared; unrecorded effects and external
-/// atomicity are outside this predicate's domain.
+/// Exact ordered record equality, including operation keys and repeated records.
+/// Unrecorded effects and external atomicity are outside this predicate's domain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExactlyOnce;
+pub struct ExactTrace;
 
-/// Equality or exactly one extra adjacent copy of a reference record.
-/// With one effect per step and one interruption after an effect but before
-/// its completion record, the interrupted effect can repeat at any position.
-/// Multiple interruptions and multi-effect bodies can exceed this allowance.
-/// The predicate neither prevents duplicates nor checks recipient idempotence.
+/// Equality or one extra adjacent identical record at any reference position.
+/// One interruption after one effect but before its completion record can produce
+/// this shape. Multiple interruptions or multi-effect bodies can exceed it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DuplicateLast;
+pub struct SingleAdjacentDuplicate;
 
-/// Equality after retaining only the first occurrence of each observed record.
-/// Reference records must be pairwise distinct for identical traces to pass.
-/// Separate equal logical operations are indistinguishable in this model.
-/// First appearances must follow reference order; duplicates can occur anywhere.
-/// This neither checks recipient idempotence nor triggers a workflow restart.
+/// Identical retries with first appearances in reference order.
+/// Each reference key must be unique. All reference operations must appear;
+/// unknown keys and changed names or payloads are rejected. Identical retries
+/// may occur anywhere after their first appearance. This checks neither
+/// recipient idempotence nor whether a workflow was restarted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReplayAll;
+pub struct OrderedRetries;
 
-impl sealed::Sealed for ExactlyOnce {}
-impl sealed::Sealed for DuplicateLast {}
-impl sealed::Sealed for ReplayAll {}
+impl sealed::Sealed for ExactTrace {}
+impl sealed::Sealed for SingleAdjacentDuplicate {}
+impl sealed::Sealed for OrderedRetries {}
 
-impl Equivalence for ExactlyOnce {
-    fn equivalent(observed: &EffectTrace, reference: &EffectTrace) -> bool {
+impl TracePredicate for ExactTrace {
+    fn matches(observed: &EffectTrace, reference: &EffectTrace) -> bool {
         observed == reference
     }
 }
 
-impl Equivalence for DuplicateLast {
-    fn equivalent(observed: &EffectTrace, reference: &EffectTrace) -> bool {
+impl TracePredicate for SingleAdjacentDuplicate {
+    fn matches(observed: &EffectTrace, reference: &EffectTrace) -> bool {
         if observed == reference {
             return true;
         }
-        if observed.records().len() != reference.records().len() + 1 {
+        if observed
+            .records()
+            .len()
+            .checked_sub(reference.records().len())
+            != Some(1)
+        {
             return false;
         }
-        // One crash, one interrupted step: observed must be reference with
-        // exactly one of its effects repeated immediately after itself.
         reference
             .records()
             .iter()
@@ -112,28 +136,60 @@ impl Equivalence for DuplicateLast {
     }
 }
 
-impl Equivalence for ReplayAll {
-    fn equivalent(observed: &EffectTrace, reference: &EffectTrace) -> bool {
-        let mut deduplicated: Vec<&EffectRecord> = Vec::new();
-        for record in observed.records() {
-            if !deduplicated.contains(&record) {
-                deduplicated.push(record);
+impl TracePredicate for OrderedRetries {
+    fn matches(observed: &EffectTrace, reference: &EffectTrace) -> bool {
+        let mut operations = HashMap::new();
+        for (index, record) in reference.records().iter().enumerate() {
+            if operations
+                .insert(record.operation, (index, record))
+                .is_some()
+            {
+                return false;
             }
         }
-        deduplicated.into_iter().eq(reference.records().iter())
+        let mut next = 0;
+        for record in observed.records() {
+            let Some(&(index, expected)) = operations.get(&record.operation) else {
+                return false;
+            };
+            if record != expected || index > next {
+                return false;
+            }
+            if index == next {
+                next += 1;
+            }
+        }
+        next == reference.records().len()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::DuplicateLast;
     use super::EffectRecord;
     use super::EffectTrace;
-    use super::Equivalence;
-    use super::ExactlyOnce;
-    use super::ReplayAll;
+    use super::ExactTrace;
+    use super::OrderedRetries;
+    use super::SingleAdjacentDuplicate;
+    use super::TracePredicate;
+    use crate::execution::ExecutionId;
     use crate::journal::EventPayload;
+    use crate::journal::Seq;
+    use crate::random::RandomBytes;
+    use crate::random::RngSource;
+    use crate::step::IdempotencyKey;
     use crate::step::StepName;
+
+    struct RenewalRng;
+
+    impl RngSource for RenewalRng {
+        fn next_bytes(&mut self) -> RandomBytes {
+            RandomBytes::new([0x52; 32])
+        }
+    }
+
+    fn renewal_key(seq: Seq) -> IdempotencyKey {
+        IdempotencyKey::new(ExecutionId::generate(&mut RenewalRng), seq)
+    }
 
     fn charge_renewal() -> StepName {
         StepName::new("charge-renewal").unwrap()
@@ -151,10 +207,26 @@ mod tests {
         EventPayload::new(br#"{"receipt_sent":true}"#.to_vec())
     }
 
+    fn record_charge(trace: &mut EffectTrace) {
+        trace.record(
+            renewal_key(Seq::zero()),
+            charge_renewal(),
+            charge_renewal_confirmation(),
+        );
+    }
+
+    fn record_receipt(trace: &mut EffectTrace) {
+        trace.record(
+            renewal_key(Seq::zero().next()),
+            send_receipt(),
+            send_receipt_confirmation(),
+        );
+    }
+
     fn reference_trace() -> EffectTrace {
         let mut trace = EffectTrace::new();
-        trace.record(charge_renewal(), charge_renewal_confirmation());
-        trace.record(send_receipt(), send_receipt_confirmation());
+        record_charge(&mut trace);
+        record_receipt(&mut trace);
         trace
     }
 
@@ -167,174 +239,170 @@ mod tests {
 
     #[test]
     fn effect_trace_record_appends_in_order() {
-        let mut trace = EffectTrace::new();
-
-        trace.record(charge_renewal(), charge_renewal_confirmation());
-        trace.record(send_receipt(), send_receipt_confirmation());
+        let trace = reference_trace();
 
         assert_eq!(
             trace.records(),
             &[
-                EffectRecord::new(charge_renewal(), charge_renewal_confirmation()),
-                EffectRecord::new(send_receipt(), send_receipt_confirmation()),
+                EffectRecord::new(
+                    renewal_key(Seq::zero()),
+                    charge_renewal(),
+                    charge_renewal_confirmation()
+                ),
+                EffectRecord::new(
+                    renewal_key(Seq::zero().next()),
+                    send_receipt(),
+                    send_receipt_confirmation()
+                ),
             ]
         );
     }
 
     #[test]
-    fn exactly_once_holds_for_identical_traces() {
+    fn exact_trace_holds_for_identical_traces() {
         let reference = reference_trace();
         let observed = reference_trace();
 
-        assert!(ExactlyOnce::equivalent(&observed, &reference));
+        assert!(ExactTrace::matches(&observed, &reference));
     }
 
     #[test]
-    fn exactly_once_fails_for_a_duplicated_trailing_effect() {
+    fn exact_trace_fails_for_a_duplicated_trailing_effect() {
         let reference = reference_trace();
         let mut observed = reference_trace();
-        observed.record(send_receipt(), send_receipt_confirmation());
+        record_receipt(&mut observed);
 
-        assert!(!ExactlyOnce::equivalent(&observed, &reference));
+        assert!(!ExactTrace::matches(&observed, &reference));
     }
 
     #[test]
-    fn exactly_once_holds_for_empty_traces() {
+    fn exact_trace_holds_for_empty_traces() {
         let reference = EffectTrace::new();
         let observed = EffectTrace::new();
 
-        assert!(ExactlyOnce::equivalent(&observed, &reference));
+        assert!(ExactTrace::matches(&observed, &reference));
     }
 
     #[test]
-    fn duplicate_last_holds_for_identical_traces() {
+    fn single_adjacent_duplicate_holds_for_identical_traces() {
         let reference = reference_trace();
         let observed = reference_trace();
 
-        assert!(DuplicateLast::equivalent(&observed, &reference));
+        assert!(SingleAdjacentDuplicate::matches(&observed, &reference));
     }
 
     #[test]
-    fn duplicate_last_holds_for_a_duplicated_trailing_effect() {
+    fn single_adjacent_duplicate_holds_for_a_duplicated_trailing_effect() {
         let reference = reference_trace();
         let mut observed = reference_trace();
-        observed.record(send_receipt(), send_receipt_confirmation());
+        record_receipt(&mut observed);
 
-        assert!(DuplicateLast::equivalent(&observed, &reference));
+        assert!(SingleAdjacentDuplicate::matches(&observed, &reference));
     }
 
     #[test]
-    fn duplicate_last_holds_for_an_interrupted_middle_step_duplicated_in_place() {
-        // Crashed after charge-renewal's effect landed but before its
-        // StepCompleted was durable: recovery reruns charge-renewal, then
-        // carries on to send-receipt.
+    fn single_adjacent_duplicate_holds_for_an_interrupted_middle_step_duplicated_in_place() {
         let reference = reference_trace();
         let mut observed = EffectTrace::new();
-        observed.record(charge_renewal(), charge_renewal_confirmation());
-        observed.record(charge_renewal(), charge_renewal_confirmation());
-        observed.record(send_receipt(), send_receipt_confirmation());
+        record_charge(&mut observed);
+        record_charge(&mut observed);
+        record_receipt(&mut observed);
 
-        assert!(DuplicateLast::equivalent(&observed, &reference));
+        assert!(SingleAdjacentDuplicate::matches(&observed, &reference));
     }
 
     #[test]
-    fn duplicate_last_fails_for_a_repeat_that_is_not_adjacent_to_its_original() {
-        // charge-renewal repeating after send-receipt is not a crash window.
-        // No single interrupted step produces this ordering.
+    fn single_adjacent_duplicate_fails_for_a_nonadjacent_repeat() {
         let reference = reference_trace();
         let mut observed = reference_trace();
-        observed.record(charge_renewal(), charge_renewal_confirmation());
+        record_charge(&mut observed);
 
-        assert!(!DuplicateLast::equivalent(&observed, &reference));
+        assert!(!SingleAdjacentDuplicate::matches(&observed, &reference));
     }
 
     #[test]
-    fn duplicate_last_fails_for_two_duplicated_effects() {
+    fn single_adjacent_duplicate_fails_for_two_duplicated_effects() {
         let reference = reference_trace();
         let mut observed = EffectTrace::new();
-        observed.record(charge_renewal(), charge_renewal_confirmation());
-        observed.record(charge_renewal(), charge_renewal_confirmation());
-        observed.record(send_receipt(), send_receipt_confirmation());
-        observed.record(send_receipt(), send_receipt_confirmation());
+        record_charge(&mut observed);
+        record_charge(&mut observed);
+        record_receipt(&mut observed);
+        record_receipt(&mut observed);
 
-        assert!(!DuplicateLast::equivalent(&observed, &reference));
+        assert!(!SingleAdjacentDuplicate::matches(&observed, &reference));
     }
 
     #[test]
-    fn duplicate_last_fails_for_an_extra_effect_against_an_empty_reference() {
+    fn single_adjacent_duplicate_fails_for_an_extra_effect_against_an_empty_reference() {
         let reference = EffectTrace::new();
         let mut observed = EffectTrace::new();
-        observed.record(charge_renewal(), charge_renewal_confirmation());
+        record_charge(&mut observed);
 
-        assert!(!DuplicateLast::equivalent(&observed, &reference));
+        assert!(!SingleAdjacentDuplicate::matches(&observed, &reference));
     }
 
     #[test]
-    fn duplicate_last_fails_when_observed_is_a_strict_prefix_of_reference() {
+    fn single_adjacent_duplicate_fails_when_observed_is_a_strict_prefix_of_reference() {
         let reference = reference_trace();
         let mut observed = EffectTrace::new();
-        observed.record(charge_renewal(), charge_renewal_confirmation());
+        record_charge(&mut observed);
 
-        assert!(!DuplicateLast::equivalent(&observed, &reference));
+        assert!(!SingleAdjacentDuplicate::matches(&observed, &reference));
     }
 
     #[test]
-    fn duplicate_last_holds_for_empty_traces() {
+    fn single_adjacent_duplicate_holds_for_empty_traces() {
         let reference = EffectTrace::new();
         let observed = EffectTrace::new();
 
-        assert!(DuplicateLast::equivalent(&observed, &reference));
+        assert!(SingleAdjacentDuplicate::matches(&observed, &reference));
     }
 
     #[test]
-    fn replay_all_holds_for_identical_traces() {
+    fn ordered_retries_holds_for_identical_traces() {
         let reference = reference_trace();
         let observed = reference_trace();
 
-        assert!(ReplayAll::equivalent(&observed, &reference));
+        assert!(OrderedRetries::matches(&observed, &reference));
     }
 
     #[test]
-    fn replay_all_holds_for_a_full_rerun_after_a_partial_reference_prefix() {
-        // Crashed after charge-renewal alone, then a ReplayAll recovery
-        // re-executed the whole workflow from scratch.
+    fn ordered_retries_holds_for_a_full_rerun_after_a_partial_reference_prefix() {
         let reference = reference_trace();
         let mut observed = EffectTrace::new();
-        observed.record(charge_renewal(), charge_renewal_confirmation());
-        observed.record(charge_renewal(), charge_renewal_confirmation());
-        observed.record(send_receipt(), send_receipt_confirmation());
+        record_charge(&mut observed);
+        record_charge(&mut observed);
+        record_receipt(&mut observed);
 
-        assert!(ReplayAll::equivalent(&observed, &reference));
+        assert!(OrderedRetries::matches(&observed, &reference));
     }
 
     #[test]
-    fn replay_all_holds_for_a_triple_execution_of_the_whole_workflow() {
-        // Two full reruns on top of the reference run, e.g. two separate
-        // crashes each triggering a fresh full re-execution.
+    fn ordered_retries_holds_for_a_triple_execution_of_the_whole_workflow() {
         let reference = reference_trace();
         let mut observed = reference_trace();
-        observed.record(charge_renewal(), charge_renewal_confirmation());
-        observed.record(send_receipt(), send_receipt_confirmation());
-        observed.record(charge_renewal(), charge_renewal_confirmation());
-        observed.record(send_receipt(), send_receipt_confirmation());
+        record_charge(&mut observed);
+        record_receipt(&mut observed);
+        record_charge(&mut observed);
+        record_receipt(&mut observed);
 
-        assert!(ReplayAll::equivalent(&observed, &reference));
+        assert!(OrderedRetries::matches(&observed, &reference));
     }
 
     #[test]
-    fn replay_all_fails_when_a_step_is_missing_from_the_reference() {
+    fn ordered_retries_fails_when_a_reference_operation_is_missing() {
         let reference = reference_trace();
         let mut observed = EffectTrace::new();
-        observed.record(charge_renewal(), charge_renewal_confirmation());
+        record_charge(&mut observed);
 
-        assert!(!ReplayAll::equivalent(&observed, &reference));
+        assert!(!OrderedRetries::matches(&observed, &reference));
     }
 
     #[test]
-    fn replay_all_holds_for_empty_traces() {
+    fn ordered_retries_holds_for_empty_traces() {
         let reference = EffectTrace::new();
         let observed = EffectTrace::new();
 
-        assert!(ReplayAll::equivalent(&observed, &reference));
+        assert!(OrderedRetries::matches(&observed, &reference));
     }
 }

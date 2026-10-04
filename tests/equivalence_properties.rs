@@ -1,6 +1,6 @@
 //! Experimental trace checks for workflows with one effect per step.
-//! Generated workflows have one to eight distinct step names and one
-//! interruption. The predicates compare observations; they do not select
+//! Generated workflows have one to eight steps, including repeated names,
+//! and one interruption. The predicates compare observations; they do not select
 //! engine behavior or establish recipient-side guarantees.
 
 use std::cell::RefCell;
@@ -11,17 +11,24 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
-use proptest::prelude::*;
+use proptest::prelude::Just;
+use proptest::prelude::ProptestConfig;
+use proptest::prop_assert;
+use proptest::prop_assert_eq;
+use proptest::prop_oneof;
+use proptest::proptest;
+use proptest::strategy::Strategy;
+use proptest::test_runner::TestCaseError;
 use yaoki::context::EngineError;
 use yaoki::context::WorkflowCtx;
 use yaoki::engine::Engine;
 use yaoki::engine::RunError;
 use yaoki::engine::Workflow;
-use yaoki::equivalence::DuplicateLast;
 use yaoki::equivalence::EffectTrace;
-use yaoki::equivalence::Equivalence;
-use yaoki::equivalence::ExactlyOnce;
-use yaoki::equivalence::ReplayAll;
+use yaoki::equivalence::ExactTrace;
+use yaoki::equivalence::OrderedRetries;
+use yaoki::equivalence::SingleAdjacentDuplicate;
+use yaoki::equivalence::TracePredicate;
 use yaoki::execution::ExecutionId;
 use yaoki::execution::WorkflowName;
 use yaoki::execution::WorkflowVersion;
@@ -80,8 +87,7 @@ fn onboarding_input() -> EventPayload {
     EventPayload::new(br#"{"email":"john.smith@example.com"}"#.to_vec())
 }
 
-/// The steps generated workflows are drawn from. Names are distinct, so a
-/// deduplicated trace can still be compared position by position.
+/// The step names generated workflows are drawn from; keys distinguish repeats.
 fn step_pool() -> Vec<StepName> {
     [
         "reserve-inventory",
@@ -98,8 +104,7 @@ fn step_pool() -> Vec<StepName> {
     .collect()
 }
 
-/// Each step's result payload, derived from its name so the effect record
-/// identifies which step produced it.
+/// Equal step names deliberately produce equal result payloads.
 fn confirmation_of(step: &StepName) -> EventPayload {
     EventPayload::new(format!(r#"{{"step":"{}","status":"done"}}"#, step.as_str()).into_bytes())
 }
@@ -137,10 +142,10 @@ impl<S: JournalStore> Workflow<S> for GeneratedWorkflow<'_> {
         self.steps
             .iter()
             .try_fold(EventPayload::new(Vec::new()), |_previous, step| {
-                ctx.step(step.clone(), |_key| {
+                ctx.step(step.clone(), |key| {
                     self.effects
                         .borrow_mut()
-                        .record(step.clone(), confirmation_of(step));
+                        .record(key, step.clone(), confirmation_of(step));
                     Ok(confirmation_of(step))
                 })
             })
@@ -198,7 +203,7 @@ impl<S: JournalStore> Workflow<S> for IdempotentWorkflow<'_> {
                 ctx.step(step.clone(), |key| {
                     self.effects
                         .borrow_mut()
-                        .record(step.clone(), confirmation_of(step));
+                        .record(key, step.clone(), confirmation_of(step));
                     self.sink.apply(key);
                     Ok(confirmation_of(step))
                 })
@@ -307,7 +312,7 @@ impl Drop for ScratchDir {
 }
 
 fn workflow_steps() -> impl Strategy<Value = Vec<StepName>> {
-    proptest::sample::subsequence(step_pool(), 1..=step_pool().len())
+    proptest::collection::vec(proptest::sample::select(step_pool()), 1..=step_pool().len())
 }
 
 /// Every crash window a stepping workflow can reach. The timer windows need
@@ -343,9 +348,40 @@ fn steps_and_side_effect_crash() -> impl Strategy<Value = (Vec<StepName>, CrashP
     })
 }
 
+#[test]
+fn recovery_of_equal_named_steps_keeps_distinct_operations_and_stable_retry_keys() {
+    let charge = StepName::new("charge-card").unwrap();
+    let steps = vec![charge.clone(), charge];
+    let reference = reference_run(&steps);
+    let store = MemoryJournal::new();
+
+    let (observed, output) = crash_then_recover(
+        &store,
+        &steps,
+        CrashPoint::AfterSideEffect(Seq::zero().next()),
+    )
+    .unwrap();
+
+    assert_ne!(
+        reference.effects.records()[0],
+        reference.effects.records()[1]
+    );
+    assert_eq!(observed.records().len(), 3);
+    assert_eq!(observed.records()[0], reference.effects.records()[0]);
+    assert_eq!(observed.records()[1], reference.effects.records()[1]);
+    assert_eq!(observed.records()[2], reference.effects.records()[1]);
+    assert!(SingleAdjacentDuplicate::matches(
+        &observed,
+        &reference.effects
+    ));
+    assert!(OrderedRetries::matches(&observed, &reference.effects));
+    assert!(!ExactTrace::matches(&observed, &reference.effects));
+    assert_eq!(output, reference.output);
+}
+
 proptest! {
     #[test]
-    fn duplicate_last_holds_after_a_crash_at_any_window_of_any_step(
+    fn single_adjacent_duplicate_holds_after_a_crash_at_any_window_of_any_step(
         (steps, point) in steps_and_crash_point()
     ) {
         let reference = reference_run(&steps);
@@ -354,8 +390,8 @@ proptest! {
         let (observed, output) = crash_then_recover(&store, &steps, point)?;
 
         prop_assert!(
-            DuplicateLast::equivalent(&observed, &reference.effects),
-            "crash at {point:?} produced {observed:?}, not a DuplicateLast \
+            SingleAdjacentDuplicate::matches(&observed, &reference.effects),
+            "crash at {point:?} produced {observed:?}, not a SingleAdjacentDuplicate \
              extension of {:?}",
             reference.effects
         );
@@ -382,7 +418,7 @@ proptest! {
     }
 
     #[test]
-    fn replay_all_holds_when_recovery_reruns_the_whole_workflow(
+    fn ordered_retries_accepts_full_reruns_with_stable_operation_keys(
         steps in workflow_steps()
     ) {
         // Separate empty journals cause full re-execution, not a predicate.
@@ -409,7 +445,7 @@ proptest! {
         }
 
         let observed = effects.into_inner();
-        prop_assert!(ReplayAll::equivalent(&observed, &reference.effects));
+        prop_assert!(OrderedRetries::matches(&observed, &reference.effects));
         prop_assert_eq!(observed.records().len(), 2 * steps.len());
         // Idempotency keys are (execution, seq): the rerun reuses them, so
         // the external system applied each effect once.
@@ -417,7 +453,7 @@ proptest! {
     }
 
     #[test]
-    fn replay_all_accepts_reruns_that_duplicate_last_rejects(
+    fn ordered_retries_accepts_reruns_that_single_adjacent_duplicate_rejects(
         steps in workflow_steps().prop_filter(
             "a single-step rerun is indistinguishable from one duplicate",
             |steps| steps.len() >= 2,
@@ -447,8 +483,8 @@ proptest! {
 
         // A full rerun of at least two steps exceeds one extra effect.
         let observed = effects.into_inner();
-        prop_assert!(ReplayAll::equivalent(&observed, &reference.effects));
-        prop_assert!(!DuplicateLast::equivalent(&observed, &reference.effects));
+        prop_assert!(OrderedRetries::matches(&observed, &reference.effects));
+        prop_assert!(!SingleAdjacentDuplicate::matches(&observed, &reference.effects));
     }
 
     #[test]
@@ -505,7 +541,7 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(32))]
 
     #[test]
-    fn exactly_once_fails_after_a_side_effect_crash_on_a_non_transactional_store(
+    fn exact_trace_fails_after_a_side_effect_crash_on_a_non_transactional_store(
         (steps, point) in steps_and_side_effect_crash()
     ) {
         // The body effect and the file append commit separately, so this
@@ -517,10 +553,10 @@ proptest! {
         let (observed, output) = crash_then_recover(&store, &steps, point)?;
 
         prop_assert!(
-            !ExactlyOnce::equivalent(&observed, &reference.effects),
-            "ExactlyOnce must not hold for a crash at {point:?}"
+            !ExactTrace::matches(&observed, &reference.effects),
+            "ExactTrace must not hold for a crash at {point:?}"
         );
-        prop_assert!(DuplicateLast::equivalent(&observed, &reference.effects));
+        prop_assert!(SingleAdjacentDuplicate::matches(&observed, &reference.effects));
         prop_assert_eq!(output, reference.output);
     }
 }

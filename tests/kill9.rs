@@ -2,9 +2,9 @@
 //! running the signup workflow, kills it in the window between
 //! `create-account`'s side effect landing and `StepCompleted` being
 //! journaled, restarts it against the same journal directory, and checks
-//! the persisted effect trace satisfies `DuplicateLast` against a
-//! failure-free reference run, with the journal ending in
-//! `ExecutionCompleted`.
+//! the persisted step-label trace has at most one trailing duplicate against
+//! a failure-free reference run, with the journal ending in `ExecutionCompleted`.
+//! These labels do not record operation keys or recipient deduplication.
 
 use std::env;
 use std::fs;
@@ -64,9 +64,8 @@ fn read_trace_lines(path: &Path) -> Vec<String> {
         .collect()
 }
 
-/// `DuplicateLast`: `observed` equals `reference`, or `observed` has
-/// exactly one extra trailing element duplicating `reference`'s last.
-fn is_duplicate_last(reference: &[String], observed: &[String]) -> bool {
+/// Checks equality or one extra copy of the final step label.
+fn has_at_most_one_trailing_duplicate(reference: &[String], observed: &[String]) -> bool {
     if observed == reference {
         return true;
     }
@@ -90,7 +89,7 @@ fn run_demo(journal_dir: &Path, trace_path: &Path, marker_path: &Path) -> bool {
 }
 
 #[test]
-fn kill9_mid_step_then_restart_satisfies_duplicate_last_and_completes() {
+fn kill9_mid_step_then_restart_duplicates_the_interrupted_step_and_completes() {
     // A failure-free reference run establishes the expected trace.
     let reference_dir = scratch_dir("reference");
     let reference_trace_path = reference_dir.join("trace.log");
@@ -138,8 +137,8 @@ fn kill9_mid_step_then_restart_satisfies_duplicate_last_and_completes() {
     // last effect, and the journal ends with ExecutionCompleted.
     let observed_trace = read_trace_lines(&trace_path);
     assert!(
-        is_duplicate_last(&reference_trace, &observed_trace),
-        "observed trace {observed_trace:?} is not a DuplicateLast extension \
+        has_at_most_one_trailing_duplicate(&reference_trace, &observed_trace),
+        "observed trace {observed_trace:?} is not a trailing-duplicate extension \
          of reference {reference_trace:?}"
     );
 

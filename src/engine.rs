@@ -207,20 +207,20 @@ pub enum RunError<E> {
 ///
 /// ```compile_fail
 /// use yaoki::engine::Engine;
-/// use yaoki::equivalence::DuplicateLast;
+/// use yaoki::equivalence::SingleAdjacentDuplicate;
 /// use yaoki::stores::memory::MemoryJournal;
 ///
 /// let store = MemoryJournal::new();
-/// let _engine = Engine::<MemoryJournal, DuplicateLast>::new(&store);
+/// let _engine = Engine::<MemoryJournal, SingleAdjacentDuplicate>::new(&store);
 /// ```
 ///
 /// ```compile_fail
 /// use yaoki::engine::Engine;
-/// use yaoki::equivalence::DuplicateLast;
+/// use yaoki::equivalence::SingleAdjacentDuplicate;
 /// use yaoki::stores::file::FileJournal;
 ///
 /// fn construct(store: &FileJournal) {
-///     let _engine = Engine::<FileJournal, DuplicateLast>::new(store);
+///     let _engine = Engine::<FileJournal, SingleAdjacentDuplicate>::new(store);
 /// }
 /// ```
 pub struct Engine<'a, S: JournalStore> {

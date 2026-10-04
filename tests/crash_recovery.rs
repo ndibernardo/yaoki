@@ -4,7 +4,7 @@
 //! effects the steps performed against a failure-free reference run.
 //!
 //! Each step records one effect per attempt. With one interruption,
-//! `DuplicateLast` accepts every tested window. Exact trace equality holds
+//! `SingleAdjacentDuplicate` accepts every tested window. Exact trace equality holds
 //! except at `AfterSideEffect`, where the effect outran its journal record.
 //! Multiple interruptions can exceed the single-duplicate allowance. These
 //! traces count body effects, not recipient-side deduplication.
@@ -16,11 +16,11 @@ use yaoki::context::WorkflowCtx;
 use yaoki::engine::Engine;
 use yaoki::engine::RunError;
 use yaoki::engine::Workflow;
-use yaoki::equivalence::DuplicateLast;
 use yaoki::equivalence::EffectTrace;
-use yaoki::equivalence::Equivalence;
-use yaoki::equivalence::ExactlyOnce;
-use yaoki::equivalence::ReplayAll;
+use yaoki::equivalence::ExactTrace;
+use yaoki::equivalence::OrderedRetries;
+use yaoki::equivalence::SingleAdjacentDuplicate;
+use yaoki::equivalence::TracePredicate;
 use yaoki::execution::ExecutionId;
 use yaoki::execution::WorkflowName;
 use yaoki::execution::WorkflowVersion;
@@ -32,6 +32,7 @@ use yaoki::journal::JournalStore;
 use yaoki::journal::Seq;
 use yaoki::random::RandomBytes;
 use yaoki::random::RngSource;
+use yaoki::step::IdempotencyKey;
 use yaoki::step::StepError;
 use yaoki::step::StepName;
 use yaoki::stores::memory::MemoryJournal;
@@ -121,16 +122,16 @@ impl Workflow<MemoryJournal> for SignupWorkflow<'_> {
         ctx: &mut WorkflowCtx<'_, MemoryJournal>,
         _input: EventPayload,
     ) -> Result<EventPayload, StepError> {
-        ctx.step(charge_card(), |_key| {
+        ctx.step(charge_card(), |key| {
             self.effects
                 .borrow_mut()
-                .record(charge_card(), charge_confirmation());
+                .record(key, charge_card(), charge_confirmation());
             Ok(charge_confirmation())
         })?;
-        ctx.step(create_account(), |_key| {
+        ctx.step(create_account(), |key| {
             self.effects
                 .borrow_mut()
-                .record(create_account(), account_created());
+                .record(key, create_account(), account_created());
             Ok(account_created())
         })
     }
@@ -159,10 +160,10 @@ impl Workflow<MemoryJournal> for TrialSignupWorkflow<'_> {
         _input: EventPayload,
     ) -> Result<EventPayload, StepError> {
         ctx.sleep_until(trial_deadline())?;
-        ctx.step(charge_card(), |_key| {
+        ctx.step(charge_card(), |key| {
             self.effects
                 .borrow_mut()
-                .record(charge_card(), charge_confirmation());
+                .record(key, charge_card(), charge_confirmation());
             Ok(charge_confirmation())
         })
     }
@@ -306,7 +307,7 @@ fn crash_before_step_scheduled_reruns_the_step_with_no_extra_effect() {
     // Nothing was journaled for charge-card and nothing was charged, so
     // recovery is indistinguishable from a first run.
     assert_eq!(recovered.effects, reference);
-    assert!(ExactlyOnce::equivalent(&recovered.effects, &reference));
+    assert!(ExactTrace::matches(&recovered.effects, &reference));
     assert_eq!(recovered.output, account_created());
     assert!(matches!(
         recovered.journal.last(),
@@ -322,7 +323,7 @@ fn crash_after_step_scheduled_reruns_the_step_without_rescheduling_it() {
 
     // The closure never ran before the crash: no duplicate effect.
     assert_eq!(recovered.effects, reference);
-    assert!(ExactlyOnce::equivalent(&recovered.effects, &reference));
+    assert!(ExactTrace::matches(&recovered.effects, &reference));
     // One StepScheduled per Seq, however many attempts follow.
     assert_eq!(count_events(&recovered.journal, &charge_card()), 1);
 }
@@ -335,7 +336,7 @@ fn crash_after_step_started_reruns_the_step_with_no_extra_effect() {
 
     // StepStarted was durable but the side effect had not landed yet.
     assert_eq!(recovered.effects, reference);
-    assert!(ExactlyOnce::equivalent(&recovered.effects, &reference));
+    assert!(ExactTrace::matches(&recovered.effects, &reference));
     assert_eq!(count_events(&recovered.journal, &charge_card()), 1);
     // The rerun is journaled as a second attempt of the same step.
     let started_attempts = recovered
@@ -357,10 +358,13 @@ fn crash_after_the_side_effect_duplicates_exactly_that_effect() {
     let recovered = crash_then_recover(CrashPoint::AfterSideEffect(Seq::zero()));
 
     assert_eq!(recovered.effects.records().len(), 3);
-    assert!(DuplicateLast::equivalent(&recovered.effects, &reference));
+    assert!(SingleAdjacentDuplicate::matches(
+        &recovered.effects,
+        &reference
+    ));
     assert!(
-        !ExactlyOnce::equivalent(&recovered.effects, &reference),
-        "a non-atomic journal-plus-effect cannot deliver ExactlyOnce"
+        !ExactTrace::matches(&recovered.effects, &reference),
+        "the interrupted effect repeats before its completion is journaled"
     );
 }
 
@@ -373,7 +377,7 @@ fn crash_after_step_completed_replays_the_step_without_rerunning_it() {
     // charge-card's result was durable, so recovery answered from the
     // journal and only create-account ran.
     assert_eq!(recovered.effects, reference);
-    assert!(ExactlyOnce::equivalent(&recovered.effects, &reference));
+    assert!(ExactTrace::matches(&recovered.effects, &reference));
     assert_eq!(recovered.output, account_created());
 }
 
@@ -409,13 +413,15 @@ fn memory_engine_after_an_effect_interruption_duplicates_the_effect() {
 
     let observed = effects.into_inner();
     let mut expected = EffectTrace::new();
-    expected.record(charge_card(), charge_confirmation());
-    expected.record(charge_card(), charge_confirmation());
-    expected.record(create_account(), account_created());
+    let charge_key = IdempotencyKey::new(execution, Seq::zero());
+    let account_key = IdempotencyKey::new(execution, Seq::zero().next());
+    expected.record(charge_key, charge_card(), charge_confirmation());
+    expected.record(charge_key, charge_card(), charge_confirmation());
+    expected.record(account_key, create_account(), account_created());
     assert_eq!(observed, expected);
     assert_eq!(output, account_created());
-    assert!(!ExactlyOnce::equivalent(&observed, &reference));
-    assert!(DuplicateLast::equivalent(&observed, &reference));
+    assert!(!ExactTrace::matches(&observed, &reference));
+    assert!(SingleAdjacentDuplicate::matches(&observed, &reference));
     assert_eq!(
         count_events(store.load(&execution).unwrap().events(), &charge_card()),
         1
@@ -466,14 +472,16 @@ fn recovery_after_two_effect_interruptions_exceeds_the_single_duplicate_allowanc
     ));
     let observed = effects.into_inner();
     let mut expected = EffectTrace::new();
-    expected.record(charge_card(), charge_confirmation());
-    expected.record(charge_card(), charge_confirmation());
-    expected.record(charge_card(), charge_confirmation());
-    expected.record(create_account(), account_created());
+    let charge_key = IdempotencyKey::new(execution, Seq::zero());
+    let account_key = IdempotencyKey::new(execution, Seq::zero().next());
+    expected.record(charge_key, charge_card(), charge_confirmation());
+    expected.record(charge_key, charge_card(), charge_confirmation());
+    expected.record(charge_key, charge_card(), charge_confirmation());
+    expected.record(account_key, create_account(), account_created());
     assert_eq!(observed, expected);
     assert_eq!(output, account_created());
-    assert!(!DuplicateLast::equivalent(&observed, &reference));
-    assert!(!ExactlyOnce::equivalent(&observed, &reference));
+    assert!(!SingleAdjacentDuplicate::matches(&observed, &reference));
+    assert!(!ExactTrace::matches(&observed, &reference));
     assert_eq!(
         count_events(store.load(&execution).unwrap().events(), &charge_card()),
         1
@@ -490,23 +498,26 @@ fn recovery_after_two_effect_interruptions_exceeds_the_single_duplicate_allowanc
 }
 
 #[test]
-fn exactly_once_predicate_with_repeated_equal_records_accepts_exact_trace_equality() {
+fn exact_trace_predicate_with_repeated_equal_records_accepts_exact_trace_equality() {
     let mut reference = EffectTrace::new();
-    reference.record(charge_card(), charge_confirmation());
-    reference.record(charge_card(), charge_confirmation());
+    let key = IdempotencyKey::new(signup_execution(), Seq::zero());
+    reference.record(key, charge_card(), charge_confirmation());
+    reference.record(key, charge_card(), charge_confirmation());
     let observed = reference.clone();
 
-    assert!(ExactlyOnce::equivalent(&observed, &reference));
+    assert!(ExactTrace::matches(&observed, &reference));
 }
 
 #[test]
-fn replay_all_predicate_with_repeated_equal_records_rejects_exact_trace_equality() {
+fn ordered_retries_with_distinct_equal_operations_accepts_exact_trace_equality() {
     let mut reference = EffectTrace::new();
-    reference.record(charge_card(), charge_confirmation());
-    reference.record(charge_card(), charge_confirmation());
+    let first = IdempotencyKey::new(signup_execution(), Seq::zero());
+    let second = IdempotencyKey::new(signup_execution(), Seq::zero().next());
+    reference.record(first, charge_card(), charge_confirmation());
+    reference.record(second, charge_card(), charge_confirmation());
     let observed = reference.clone();
 
-    assert!(!ReplayAll::equivalent(&observed, &reference));
+    assert!(OrderedRetries::matches(&observed, &reference));
 }
 
 #[test]
@@ -516,8 +527,11 @@ fn crash_after_the_side_effect_of_the_final_step_duplicates_the_trailing_effect(
     let recovered = crash_then_recover(CrashPoint::AfterSideEffect(Seq::zero().next()));
 
     assert_eq!(recovered.effects.records().len(), 3);
-    assert!(DuplicateLast::equivalent(&recovered.effects, &reference));
-    assert!(!ExactlyOnce::equivalent(&recovered.effects, &reference));
+    assert!(SingleAdjacentDuplicate::matches(
+        &recovered.effects,
+        &reference
+    ));
+    assert!(!ExactTrace::matches(&recovered.effects, &reference));
 }
 
 #[test]
@@ -535,7 +549,7 @@ fn crash_after_timer_scheduled_rearms_the_timer_without_rescheduling_it() {
         .count();
     assert_eq!(scheduled, 1);
     assert_eq!(recovered.effects, reference);
-    assert!(ExactlyOnce::equivalent(&recovered.effects, &reference));
+    assert!(ExactTrace::matches(&recovered.effects, &reference));
 }
 
 #[test]
@@ -551,7 +565,7 @@ fn crash_after_timer_fired_replays_the_timer_and_runs_the_remaining_step_once() 
         .count();
     assert_eq!(fired, 1);
     assert_eq!(recovered.effects, reference);
-    assert!(ExactlyOnce::equivalent(&recovered.effects, &reference));
+    assert!(ExactTrace::matches(&recovered.effects, &reference));
     assert_eq!(recovered.output, charge_confirmation());
 }
 
